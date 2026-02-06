@@ -27,18 +27,19 @@ const (
 func (s *Session) runSender(ctx context.Context) error {
 	state := stxInit
 	var (
-		curOffer   *FileOffer
-		curInfo    FileInfo
-		fileOffset int64
-		bytesSent  int64
-		retries    int
-		blockSize  int
-		goodBlocks int
-		goodNeeded int
-		unreliable  bool
-		zcrcwNext   bool
-		filesLeft   int
-		bytesLeft   int64
+		curOffer     *FileOffer
+		curInfo      FileInfo
+		fileOffset   int64
+		bytesSent    int64
+		retries      int
+		blockSize    int
+		goodBlocks   int
+		goodNeeded   int
+		unreliable   bool
+		zcrcwNext    bool
+		zcrcwRetries int
+		filesLeft    int
+		bytesLeft    int64
 	)
 
 	blockSize = 256
@@ -142,6 +143,8 @@ func (s *Session) runSender(ctx context.Context) error {
 			bytesSent = 0
 			retries = 0
 			goodBlocks = 0
+			zcrcwNext = false
+			zcrcwRetries = 0
 			state = stxFileInfo
 
 		case stxFileInfo:
@@ -256,6 +259,7 @@ func (s *Session) runSender(ctx context.Context) error {
 							goodBlocks = 0
 							unreliable = true
 							zcrcwNext = true
+							zcrcwRetries = 0
 							state = stxData
 							sendLoop = true
 							continue
@@ -313,6 +317,7 @@ func (s *Session) runSender(ctx context.Context) error {
 							goodBlocks = 0
 							unreliable = true
 							zcrcwNext = true
+							zcrcwRetries = 0
 							state = stxData
 							sendLoop = true
 						default:
@@ -362,29 +367,56 @@ func (s *Session) runSender(ctx context.Context) error {
 
 					// If ZCRCW (post-ZRPOS flush), wait for ZACK then restart frame
 					if endType == ZCRCW {
-						zcrcwNext = false
-						rxHdr, err := s.recvHeader()
-						if err != nil {
-							if err == errAbortReceived {
-								return err
+						for {
+							rxHdr, err := s.recvHeader()
+							if err != nil {
+								if err == errAbortReceived {
+									return err
+								}
+								zcrcwRetries++
+								if zcrcwRetries >= s.cfg.MaxRetries {
+									return fmt.Errorf("zmodem: ZCRCW flush timeout after %d retries: %w", zcrcwRetries, err)
+								}
+								// Keep waiting; ZCRCW already ended the frame.
+								continue
 							}
-							// Timeout or error — restart frame; receiver will ZRPOS again if needed.
-							state = stxData
-							sendLoop = true
-							continue
-						}
-						switch rxHdr.Type {
-						case ZACK:
-							lastAckOffset = rxHdr.Position()
-						case ZRPOS:
-							newPos := rxHdr.Position()
-							if err := s.seekFile(curOffer, newPos); err != nil {
-								return err
+							switch rxHdr.Type {
+							case ZACK:
+								ackPos := rxHdr.Position()
+								// Per spec: ignore ZACK with an address that disagrees with the sender.
+								if ackPos != fileOffset {
+									s.logger.Debug("ignoring ZACK after ZCRCW flush (offset mismatch)",
+										"got", ackPos, "want", fileOffset)
+									zcrcwRetries++
+									if zcrcwRetries >= s.cfg.MaxRetries {
+										return fmt.Errorf("zmodem: ZCRCW flush max retries exceeded (stale ZACKs)")
+									}
+									continue
+								}
+								lastAckOffset = ackPos
+								zcrcwNext = false
+								zcrcwRetries = 0
+							case ZRPOS:
+								newPos := rxHdr.Position()
+								if err := s.seekFile(curOffer, newPos); err != nil {
+									return err
+								}
+								fileOffset = newPos
+								bytesSent = newPos
+								blockSize = max(blockSize/4, 32)
+								goodBlocks = 0
+								unreliable = true
+								zcrcwNext = true
+								zcrcwRetries = 0
+							default:
+								s.logger.Debug("unexpected ZCRCW response", "type", frameTypeName(rxHdr.Type))
+								zcrcwRetries++
+								if zcrcwRetries >= s.cfg.MaxRetries {
+									return fmt.Errorf("zmodem: ZCRCW flush max retries exceeded (unexpected frames)")
+								}
+								continue
 							}
-							fileOffset = newPos
-							bytesSent = newPos
-							blockSize = max(blockSize/4, 32)
-							goodBlocks = 0
+							break
 						}
 						// ZCRCW ends the frame; restart with fresh ZDATA header
 						state = stxData
@@ -422,6 +454,7 @@ func (s *Session) runSender(ctx context.Context) error {
 								goodBlocks = 0
 								unreliable = true
 								zcrcwNext = true
+								zcrcwRetries = 0
 								state = stxData
 								sendLoop = true
 							default:
@@ -500,6 +533,7 @@ func (s *Session) runSender(ctx context.Context) error {
 				goodBlocks = 0
 				unreliable = true
 				zcrcwNext = true
+				zcrcwRetries = 0
 				state = stxData
 			case ZNAK:
 				retries++
