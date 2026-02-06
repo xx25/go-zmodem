@@ -11,7 +11,7 @@ func TestHexHeaderRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 
 	tw := newTransportWriter(&buf, false)
-	tr := newTransportReader(&buf, 1200, slog.Default())
+	tr := newTransportReader(&buf, 1200, 0, slog.Default())
 
 	s := &Session{
 		tw:     tw,
@@ -63,7 +63,7 @@ func TestBinHeaderRoundTripCRC16(t *testing.T) {
 
 	s := &Session{
 		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, slog.Default()),
+		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: false,
 	}
@@ -95,7 +95,7 @@ func TestBinHeaderRoundTripCRC32(t *testing.T) {
 
 	s := &Session{
 		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, slog.Default()),
+		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: true,
 	}
@@ -171,7 +171,7 @@ func TestHexHeaderLowercaseDigits(t *testing.T) {
 
 	s := &Session{
 		tw:     newTransportWriter(&buf, false),
-		tr:     newTransportReader(&buf, 1200, slog.Default()),
+		tr:     newTransportReader(&buf, 1200, 0, slog.Default()),
 		logger: slog.Default(),
 	}
 

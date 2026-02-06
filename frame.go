@@ -256,9 +256,9 @@ func (s *Session) recvHexHeader() (Header, error) {
 		return Header{}, fmt.Errorf("zmodem: expected LF after hex header CR, got 0x%02x", lf)
 	}
 
-	// XON may follow (except for ZACK/ZFIN) — consume if present
-	if hdr.Type != ZACK && hdr.Type != ZFIN {
-		// Peek for XON
+	// XON may follow (except for ZACK/ZFIN) — consume if present.
+	// Only attempt if data is already buffered to avoid blocking.
+	if hdr.Type != ZACK && hdr.Type != ZFIN && s.tr.r.Buffered() > 0 {
 		peek, err := s.tr.r.Peek(1)
 		if err == nil && len(peek) > 0 && (peek[0]&0x7f) == XON {
 			_, _ = s.tr.readByte() // consume XON

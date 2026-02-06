@@ -11,7 +11,7 @@ func TestSubpacketRoundTripCRC16(t *testing.T) {
 
 	s := &Session{
 		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, slog.Default()),
+		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: false,
 	}
@@ -47,7 +47,7 @@ func TestSubpacketRoundTripCRC32(t *testing.T) {
 
 	s := &Session{
 		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, slog.Default()),
+		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: true,
 	}
@@ -76,7 +76,7 @@ func TestSubpacketEmptyData(t *testing.T) {
 
 	s := &Session{
 		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, slog.Default()),
+		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: false,
 	}
@@ -104,7 +104,7 @@ func TestSubpacketAllZDLEBytes(t *testing.T) {
 
 	s := &Session{
 		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, slog.Default()),
+		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: false,
 	}

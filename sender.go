@@ -36,7 +36,6 @@ func (s *Session) runSender(ctx context.Context) error {
 		goodBlocks int
 		goodNeeded int
 		unreliable bool
-		lastHeader *Header // for ZNAK resend
 		filesLeft  int
 		bytesLeft  int64
 	)
@@ -59,8 +58,6 @@ func (s *Session) runSender(ctx context.Context) error {
 			if err := s.sendHexHeader(hdr); err != nil {
 				return err
 			}
-			saved := hdr
-			lastHeader = &saved
 
 			// Wait for ZRINIT
 			rxHdr, err := s.recvHeaderRetry(ctx, &retries)
@@ -98,8 +95,6 @@ func (s *Session) runSender(ctx context.Context) error {
 			if err := s.sendBinHeader(hdr); err != nil {
 				return err
 			}
-			saved := hdr
-			lastHeader = &saved
 
 			// ZSINIT data must escape control chars even if not globally set
 			oldEsc := s.tw.escapeAll
@@ -155,8 +150,6 @@ func (s *Session) runSender(ctx context.Context) error {
 			if err := s.sendBinHeader(hdr); err != nil {
 				return err
 			}
-			saved := hdr
-			lastHeader = &saved
 
 			// Send file metadata subpacket
 			meta := marshalFileInfo(curOffer, filesLeft, bytesLeft)
@@ -228,23 +221,112 @@ func (s *Session) runSender(ctx context.Context) error {
 				return err
 			}
 
-			// Data transmission loop
+			// Data transmission loop with reverse channel sampling
 			buf := make([]byte, s.cfg.MaxBlockSize)
-			sendErr := false
+			lastAckOffset := fileOffset
+			var subpacketCount int
+			canFDX := (s.remoteFlags & CANFDX) != 0
+			const zcrcqInterval = 8
 
-			for !sendErr {
+			sendLoop := false // true means break inner loop
+			for !sendLoop {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
 
+				// Check reverse channel (opportunistic, non-blocking)
+				if s.tr.peekForZPAD() {
+					rxHdr, err := s.recvHeader()
+					if err != nil {
+						if err == errAbortReceived {
+							return err
+						}
+						s.logger.Debug("reverse channel read error", "err", err)
+					} else {
+						switch rxHdr.Type {
+						case ZRPOS:
+							newPos := rxHdr.Position()
+							if err := s.seekFile(curOffer, newPos); err != nil {
+								return err
+							}
+							fileOffset = newPos
+							bytesSent = newPos
+							blockSize = max(blockSize/4, 32)
+							goodBlocks = 0
+							unreliable = true
+							state = stxData
+							sendLoop = true
+							continue
+						case ZACK:
+							lastAckOffset = rxHdr.Position()
+						default:
+							s.logger.Debug("unexpected reverse channel frame", "type", frameTypeName(rxHdr.Type))
+						}
+					}
+				}
+
+				// Window flow control: block when window is full
+				if s.remoteWindowSize > 0 && (fileOffset-lastAckOffset) >= int64(s.remoteWindowSize) {
+					// Solicit ZACK with zero-length ZCRCQ
+					if err := s.sendSubpacket(nil, ZCRCQ); err != nil {
+						return err
+					}
+					windowRetries := 0
+					for {
+						rxHdr, err := s.recvHeader()
+						if err != nil {
+							windowRetries++
+							if windowRetries >= s.cfg.MaxRetries {
+								return fmt.Errorf("zmodem: window flow control timeout after %d retries", windowRetries)
+							}
+							// Resend zero-length ZCRCQ
+							if err := s.sendSubpacket(nil, ZCRCQ); err != nil {
+								return err
+							}
+							continue
+						}
+						switch rxHdr.Type {
+						case ZACK:
+							lastAckOffset = rxHdr.Position()
+						case ZRPOS:
+							newPos := rxHdr.Position()
+							if err := s.seekFile(curOffer, newPos); err != nil {
+								return err
+							}
+							fileOffset = newPos
+							bytesSent = newPos
+							blockSize = max(blockSize/4, 32)
+							goodBlocks = 0
+							unreliable = true
+							state = stxData
+							sendLoop = true
+						default:
+							s.logger.Debug("unexpected frame in window wait", "type", frameTypeName(rxHdr.Type))
+						}
+						break
+					}
+					if sendLoop {
+						continue
+					}
+					// If window is still full after ZACK, re-check at top of loop
+					if (fileOffset - lastAckOffset) >= int64(s.remoteWindowSize) {
+						continue
+					}
+				}
+
+				// Read file data
 				n, readErr := curOffer.Reader.Read(buf[:blockSize])
 				if n > 0 {
-					var endType byte
 					atEOF := readErr == io.EOF
 
-					if atEOF {
+					// Choose end type
+					var endType byte
+					switch {
+					case atEOF:
 						endType = ZCRCE
-					} else {
+					case canFDX && subpacketCount > 0 && subpacketCount%zcrcqInterval == 0:
+						endType = ZCRCQ
+					default:
 						endType = ZCRCG
 					}
 
@@ -253,10 +335,56 @@ func (s *Session) runSender(ctx context.Context) error {
 					}
 					fileOffset += int64(n)
 					bytesSent = fileOffset
+					subpacketCount++
 					goodBlocks++
 
+					// If ZCRCQ, read ZACK/ZRPOS response (bounded by RecvTimeout)
+					if endType == ZCRCQ {
+						zcrcqRetries := 0
+						for {
+							rxHdr, err := s.recvHeader()
+							if err != nil {
+								zcrcqRetries++
+								if zcrcqRetries >= s.cfg.MaxRetries {
+									return fmt.Errorf("zmodem: ZCRCQ response timeout after %d retries", zcrcqRetries)
+								}
+								// Solicit again with zero-length ZCRCQ
+								if err := s.sendSubpacket(nil, ZCRCQ); err != nil {
+									return err
+								}
+								continue
+							}
+							switch rxHdr.Type {
+							case ZACK:
+								lastAckOffset = rxHdr.Position()
+							case ZRPOS:
+								newPos := rxHdr.Position()
+								if err := s.seekFile(curOffer, newPos); err != nil {
+									return err
+								}
+								fileOffset = newPos
+								bytesSent = newPos
+								blockSize = max(blockSize/4, 32)
+								goodBlocks = 0
+								unreliable = true
+								state = stxData
+								sendLoop = true
+							default:
+								s.logger.Debug("unexpected ZCRCQ response", "type", frameTypeName(rxHdr.Type))
+							}
+							break
+						}
+						if sendLoop {
+							continue
+						}
+					}
+
 					// Block size adaptation
-					if goodBlocks >= goodNeeded && blockSize < s.cfg.MaxBlockSize {
+					adaptNeeded := goodNeeded
+					if unreliable {
+						adaptNeeded = 16
+					}
+					if goodBlocks >= adaptNeeded && blockSize < s.cfg.MaxBlockSize {
 						blockSize *= 2
 						if blockSize > s.cfg.MaxBlockSize {
 							blockSize = s.cfg.MaxBlockSize
@@ -269,7 +397,7 @@ func (s *Session) runSender(ctx context.Context) error {
 
 					if atEOF {
 						state = stxEOF
-						sendErr = true
+						sendLoop = true
 					}
 				} else if readErr != nil {
 					if readErr == io.EOF {
@@ -283,7 +411,7 @@ func (s *Session) runSender(ctx context.Context) error {
 					} else {
 						return fmt.Errorf("zmodem: file read error: %w", readErr)
 					}
-					sendErr = true
+					sendLoop = true
 				}
 			}
 
@@ -292,8 +420,6 @@ func (s *Session) runSender(ctx context.Context) error {
 			if err := s.sendHexHeader(hdr); err != nil {
 				return err
 			}
-			saved := hdr
-			lastHeader = &saved
 			state = stxEOFAck
 
 		case stxEOFAck:
@@ -334,8 +460,6 @@ func (s *Session) runSender(ctx context.Context) error {
 			if err := s.sendHexHeader(hdr); err != nil {
 				return err
 			}
-			saved := hdr
-			lastHeader = &saved
 			state = stxFinAck
 
 		case stxFinAck:
@@ -364,8 +488,6 @@ func (s *Session) runSender(ctx context.Context) error {
 			}
 		}
 
-		_ = lastHeader
-		_ = unreliable
 	}
 
 	return nil
@@ -374,6 +496,9 @@ func (s *Session) runSender(ctx context.Context) error {
 // processZRINIT processes receiver's ZRINIT flags.
 func (s *Session) processZRINIT(hdr Header) {
 	s.remoteFlags = hdr.ZF0()
+
+	// Receiver buffer size (ZP0 = Data[0], ZP1 = Data[1])
+	s.remoteWindowSize = int(hdr.Data[0]) | int(hdr.Data[1])<<8
 
 	// CRC-32 negotiation
 	if s.cfg.Use32BitCRC && (s.remoteFlags&CANFC32) != 0 {

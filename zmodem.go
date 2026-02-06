@@ -66,7 +66,11 @@ type Config struct {
 	Use32BitCRC bool
 	// AttnSequence: attention string for interrupting sender (max 32 bytes)
 	AttnSequence []byte
-	// RecvTimeout: timeout waiting for data from remote (default 10s)
+	// RecvTimeout: idle timeout for reads from the remote (default 10s).
+	// Effective only when the transport implements SetReadDeadline (e.g. net.Conn).
+	// When set, this overwrites any existing read deadline on the transport.
+	// For transports without deadline support, callers must handle cancellation
+	// externally (e.g. by closing the transport).
 	RecvTimeout time.Duration
 	// Capabilities: receiver capability flags to advertise
 	Capabilities byte
@@ -109,10 +113,11 @@ type Session struct {
 	tr *transportReader
 
 	// Protocol state
-	useCRC32       bool   // negotiated CRC mode
-	remoteFlags    byte   // remote ZRINIT ZF0 flags
-	remoteEscAll   bool   // remote wants all control chars escaped
-	attnSeq        []byte // negotiated attention sequence
+	useCRC32         bool   // negotiated CRC mode
+	remoteFlags      byte   // remote ZRINIT ZF0 flags
+	remoteEscAll     bool   // remote wants all control chars escaped
+	attnSeq          []byte // negotiated attention sequence
+	remoteWindowSize int    // receiver buffer size from ZRINIT (ZP0+ZP1)
 
 	mu     sync.Mutex
 	active bool // prevents concurrent Send/Receive
@@ -134,7 +139,7 @@ func NewSession(transport io.ReadWriter, handler FileHandler, cfg *Config) *Sess
 		cfg:       c,
 		logger:    logger,
 		tw:        newTransportWriter(transport, c.EscapeAll),
-		tr:        newTransportReader(transport, c.GarbageThreshold, logger),
+		tr:        newTransportReader(transport, c.GarbageThreshold, c.RecvTimeout, logger),
 	}
 	return s
 }
@@ -145,6 +150,7 @@ func (s *Session) Send(ctx context.Context) error {
 		return errors.New("zmodem: session already active")
 	}
 	defer s.release()
+	defer s.tr.clearDeadline()
 	return s.runSender(ctx)
 }
 
@@ -154,6 +160,7 @@ func (s *Session) Receive(ctx context.Context) error {
 		return errors.New("zmodem: session already active")
 	}
 	defer s.release()
+	defer s.tr.clearDeadline()
 	return s.runReceiver(ctx)
 }
 

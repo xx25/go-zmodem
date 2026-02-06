@@ -6,43 +6,59 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 )
 
 var (
 	errGarbageOverflow = errors.New("zmodem: garbage count exceeded threshold")
 	errAbortReceived   = errors.New("zmodem: session aborted by remote (5x CAN)")
-	errBadEscape      = errors.New("zmodem: invalid ZDLE escape sequence") //nolint:unused
-	errTimeout        = errors.New("zmodem: read timeout")               //nolint:unused
 	errUnsupportedEnc  = errors.New("zmodem: unsupported frame encoding")
 )
+
+// deadlineSetter is implemented by transports that support read deadlines (e.g. net.Conn).
+type deadlineSetter interface {
+	SetReadDeadline(time.Time) error
+}
 
 // transportReader wraps an io.Reader with buffering, ZDLE decoding,
 // XON/XOFF stripping, and garbage counting.
 type transportReader struct {
-	r              *bufio.Reader
-	garbageCount   int
-	garbageMax     int
-	canCount       int // consecutive CAN characters seen
-	logger         *slog.Logger
+	r            *bufio.Reader
+	ds           deadlineSetter // nil if transport lacks deadline support
+	timeout      time.Duration  // idle timeout (from Config.RecvTimeout)
+	garbageCount int
+	garbageMax   int
+	canCount     int // consecutive CAN characters seen
+	logger       *slog.Logger
 }
 
-func newTransportReader(r io.Reader, garbageMax int, logger *slog.Logger) *transportReader {
-	return &transportReader{
+func newTransportReader(r io.Reader, garbageMax int, timeout time.Duration, logger *slog.Logger) *transportReader {
+	tr := &transportReader{
 		r:          bufio.NewReaderSize(r, 4096),
+		timeout:    timeout,
 		garbageMax: garbageMax,
 		logger:     logger,
 	}
+	if ds, ok := r.(deadlineSetter); ok {
+		tr.ds = ds
+	}
+	return tr
 }
 
 // readByte reads one raw byte from the transport.
+// When the bufio buffer is empty and a deadline-capable transport is present,
+// sets an idle timeout before blocking on the underlying read.
 func (tr *transportReader) readByte() (byte, error) {
+	if tr.r.Buffered() == 0 && tr.ds != nil && tr.timeout > 0 {
+		tr.ds.SetReadDeadline(time.Now().Add(tr.timeout))
+	}
 	return tr.r.ReadByte()
 }
 
 // readByteStrip reads one byte, stripping XON/XOFF.
 func (tr *transportReader) readByteStrip() (byte, error) {
 	for {
-		b, err := tr.r.ReadByte()
+		b, err := tr.readByte()
 		if err != nil {
 			return 0, err
 		}
@@ -232,6 +248,34 @@ func (tr *transportReader) scanForPad() (byte, error) {
 // resetGarbage resets the garbage counter (after successful frame).
 func (tr *transportReader) resetGarbage() {
 	tr.garbageCount = 0
+}
+
+// peekForZPAD scans all currently buffered bytes for a ZPAD or CAN character.
+// Returns true if a frame start or abort might be pending.
+// This is purely opportunistic — it does not block or issue I/O.
+func (tr *transportReader) peekForZPAD() bool {
+	n := tr.r.Buffered()
+	if n == 0 {
+		return false
+	}
+	peek, err := tr.r.Peek(n)
+	if err != nil {
+		return false
+	}
+	for _, b := range peek {
+		if b == ZPAD || b == CAN {
+			return true
+		}
+	}
+	return false
+}
+
+// clearDeadline removes any read deadline set on the transport.
+// Called on session exit so callers can reuse the transport without stale deadlines.
+func (tr *transportReader) clearDeadline() {
+	if tr.ds != nil && tr.timeout > 0 {
+		_ = tr.ds.SetReadDeadline(time.Time{})
+	}
 }
 
 // purge reads and discards data for a short duration to clear stale transport data.

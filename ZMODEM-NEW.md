@@ -399,12 +399,14 @@ func crc16Verify(dataWithCRC []byte) bool {
 
 // CRC-32 uses the standard IEEE polynomial (same as ZMODEM spec).
 // Init: 0xFFFFFFFF, finalize with XOR 0xFFFFFFFF (done internally by stdlib).
-// Verification magic: when receiver feeds data+CRC32 through, result == 0xDEBB20E3
+// Verification magic: when receiver feeds data+CRC32 through, result == 0x2144DF1C.
+// lrzsz checks raw CRC against 0xDEBB20E3 (no final XOR). Go's ChecksumIEEE applies
+// final XOR (^0xFFFFFFFF), so the magic becomes 0xDEBB20E3 ^ 0xFFFFFFFF = 0x2144DF1C.
 func crc32Calc(data []byte) uint32 {
     return crc32.ChecksumIEEE(data)
 }
 
-const crc32VerifyMagic = 0xDEBB20E3
+const crc32VerifyMagic = 0x2144DF1C
 
 func crc32Verify(dataWithCRC []byte) bool {
     return crc32.ChecksumIEEE(dataWithCRC) == crc32VerifyMagic

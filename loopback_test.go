@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -531,3 +534,336 @@ func TestLoopbackCRC32(t *testing.T) {
 		t.Errorf("content mismatch")
 	}
 }
+
+// corruptingWriter wraps an io.Writer and corrupts the CRC of the Nth
+// ZCRCG subpacket (identified by the ZDLE+ZCRCG byte pair in the stream).
+type corruptingWriter struct {
+	w            io.Writer
+	targetCount  int     // which subpacket to corrupt (1-based)
+	currentCount int32   // atomic counter for ZCRCG sequences seen
+	prev         byte    // previous byte for ZDLE detection
+	corrupted    atomic.Bool
+}
+
+func (cw *corruptingWriter) Write(p []byte) (int, error) {
+	if cw.corrupted.Load() {
+		return cw.w.Write(p)
+	}
+
+	// Scan for ZDLE+ZCRCG pairs; corrupt the next 2 bytes (CRC) after the target
+	buf := make([]byte, len(p))
+	copy(buf, p)
+
+	for i := 0; i < len(buf); i++ {
+		if cw.prev == ZDLE && buf[i] == ZCRCG {
+			cw.currentCount++
+			if int(cw.currentCount) == cw.targetCount {
+				// Corrupt the CRC bytes that follow this ZCRCG.
+				// They may be in this write or a subsequent one.
+				// Corrupt what we can in this buffer.
+				for j := i + 1; j < len(buf) && j <= i+4; j++ {
+					buf[j] ^= 0xFF
+				}
+				cw.corrupted.Store(true)
+			}
+		}
+		cw.prev = buf[i]
+	}
+
+	return cw.w.Write(buf)
+}
+
+func TestLoopbackMidStreamZRPOS(t *testing.T) {
+	// Create channel-based transports
+	// Channel 1: sender writes -> (corrupt) -> receiver reads
+	r1, w1 := bufferedPipe(256)
+	// Channel 2: receiver writes -> sender reads
+	r2, w2 := bufferedPipe(256)
+
+	// Wrap w1 with a corrupting writer that corrupts the 3rd ZCRCG subpacket
+	cw := &corruptingWriter{w: w1, targetCount: 3}
+
+	senderT := &pipeReadWriter{Reader: r2, Writer: cw}
+	receiverT := &pipeReadWriter{Reader: r1, Writer: w2}
+
+	// 16KB file to ensure enough subpackets for corruption to trigger
+	testContent := make([]byte, 16384)
+	rand.Read(testContent)
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{
+			Name:   "corrupt_test.bin",
+			Size:   int64(len(testContent)),
+			Reader: bytes.NewReader(testContent),
+		},
+	}
+
+	receiverHandler := newTestHandler()
+
+	// Use small block size to generate many subpackets
+	senderCfg := &Config{MaxBlockSize: 512, Use32BitCRC: true}
+	receiverCfg := &Config{MaxBlockSize: 512, Use32BitCRC: true}
+
+	sender := NewSession(senderT, senderHandler, senderCfg)
+	receiver := NewSession(receiverT, receiverHandler, receiverCfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer w1.Close()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer w2.Close()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+
+	received, ok := receiverHandler.receivedFiles["corrupt_test.bin"]
+	if !ok {
+		t.Fatal("corrupt_test.bin not received")
+	}
+	if !bytes.Equal(received.Bytes(), testContent) {
+		t.Errorf("content mismatch: got %d bytes, want %d bytes", received.Len(), len(testContent))
+	}
+}
+
+func TestRecvTimeoutDeadlineCapableTransport(t *testing.T) {
+	// net.Pipe provides a synchronous, deadline-capable transport
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	// Drain c2 so the receiver's ZRINIT writes don't block on the synchronous pipe.
+	// net.Pipe is unbuffered, so writes block until the other end reads.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			_, err := c2.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	handler := newTestHandler()
+
+	// Short timeout to make the test fast
+	cfg := &Config{RecvTimeout: 50 * time.Millisecond}
+	session := NewSession(c1, handler, cfg)
+
+	start := time.Now()
+	err := session.Receive(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+
+	// The error surfaces as max retries exceeded (each retry triggers a deadline timeout)
+	// or as a direct timeout error — either is acceptable.
+	errStr := err.Error()
+	if !strings.Contains(errStr, "timeout") && !strings.Contains(errStr, "deadline") &&
+		!strings.Contains(errStr, "i/o timeout") && !strings.Contains(errStr, "max retries") {
+		t.Fatalf("expected timeout or max retries error, got: %v", err)
+	}
+
+	// Should complete within a reasonable time (retries * timeout + overhead).
+	// The receiver goes through srxInit (sends ZRINIT), then srxFileWait where
+	// each recvHeader hits the timeout, retries MaxRetries times, plus the initial
+	// ZRINIT send and consecutive error tracking.
+	maxExpected := 5 * time.Second
+	if elapsed > maxExpected {
+		t.Errorf("took too long: %v (max expected %v)", elapsed, maxExpected)
+	}
+	t.Logf("completed in %v with error: %v", elapsed, err)
+}
+
+// TestLoopbackZCRCQCheckpoints tests that ZCRCQ checkpoints are emitted during
+// streaming when the receiver advertises CANFDX.
+func TestLoopbackZCRCQCheckpoints(t *testing.T) {
+	// Create transports with a snooping wrapper to detect ZCRCQ in the stream
+	r1, w1 := bufferedPipe(256)
+	r2, w2 := bufferedPipe(256)
+
+	zcrcqCount := atomic.Int32{}
+	snoopW := &snoopingWriter{w: w1, onByte: func(prev, cur byte) {
+		if prev == ZDLE && cur == ZCRCQ {
+			zcrcqCount.Add(1)
+		}
+	}}
+
+	senderT := &pipeReadWriter{Reader: r2, Writer: snoopW}
+	receiverT := &pipeReadWriter{Reader: r1, Writer: w2}
+
+	// 32KB file — enough subpackets to trigger ZCRCQ at interval=8
+	testContent := make([]byte, 32768)
+	rand.Read(testContent)
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{
+			Name:   "zcrcq_test.bin",
+			Size:   int64(len(testContent)),
+			Reader: bytes.NewReader(testContent),
+		},
+	}
+
+	receiverHandler := newTestHandler()
+
+	// Small block size, receiver advertises CANFDX via default caps
+	senderCfg := &Config{MaxBlockSize: 512}
+	receiverCfg := &Config{MaxBlockSize: 512}
+
+	sender := NewSession(senderT, senderHandler, senderCfg)
+	receiver := NewSession(receiverT, receiverHandler, receiverCfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer w1.Close()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer w2.Close()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	// Verify file was received correctly
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+	received, ok := receiverHandler.receivedFiles["zcrcq_test.bin"]
+	if !ok {
+		t.Fatal("zcrcq_test.bin not received")
+	}
+	if !bytes.Equal(received.Bytes(), testContent) {
+		t.Error("content mismatch")
+	}
+
+	// With 32KB / starting 256-byte blocks growing to 512, there should be many subpackets,
+	// and ZCRCQ should have been emitted at least once (every 8th subpacket after the first).
+	if zcrcqCount.Load() == 0 {
+		t.Error("expected at least one ZCRCQ checkpoint, got 0")
+	}
+	t.Logf("ZCRCQ checkpoints emitted: %d", zcrcqCount.Load())
+}
+
+// TestLoopbackWindowFlowControl tests the window flow control path where the
+// receiver advertises a non-zero buffer size.
+func TestLoopbackWindowFlowControl(t *testing.T) {
+	r1, w1 := bufferedPipe(256)
+	r2, w2 := bufferedPipe(256)
+
+	senderT := &pipeReadWriter{Reader: r2, Writer: w1}
+	receiverT := &pipeReadWriter{Reader: r1, Writer: w2}
+
+	// 8KB file
+	testContent := make([]byte, 8192)
+	rand.Read(testContent)
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{
+			Name:   "window_test.bin",
+			Size:   int64(len(testContent)),
+			Reader: bytes.NewReader(testContent),
+		},
+	}
+
+	receiverHandler := newTestHandler()
+
+	senderCfg := &Config{MaxBlockSize: 512}
+	// Receiver advertises 2048-byte window
+	receiverCfg := &Config{MaxBlockSize: 512, WindowSize: 2048}
+
+	sender := NewSession(senderT, senderHandler, senderCfg)
+	receiver := NewSession(receiverT, receiverHandler, receiverCfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer w1.Close()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer w2.Close()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+	received, ok := receiverHandler.receivedFiles["window_test.bin"]
+	if !ok {
+		t.Fatal("window_test.bin not received")
+	}
+	if !bytes.Equal(received.Bytes(), testContent) {
+		t.Error("content mismatch")
+	}
+}
+
+// snoopingWriter wraps a writer and calls onByte for each consecutive byte pair.
+type snoopingWriter struct {
+	w      io.Writer
+	onByte func(prev, cur byte)
+	prev   byte
+}
+
+func (sw *snoopingWriter) Write(p []byte) (int, error) {
+	for _, b := range p {
+		sw.onByte(sw.prev, b)
+		sw.prev = b
+	}
+	return sw.w.Write(p)
+}
+

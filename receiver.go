@@ -286,9 +286,11 @@ func (s *Session) runReceiver(ctx context.Context) error {
 				return err
 			}
 
-			// Read "OO" (over and out) — best effort
-			buf := make([]byte, 2)
-			_, _ = io.ReadFull(s.tr.r, buf)
+			// Read "OO" (over and out) — best effort, only if already buffered
+			if s.tr.r.Buffered() >= 2 {
+				buf := make([]byte, 2)
+				_, _ = io.ReadFull(s.tr.r, buf)
+			}
 
 			state = srxDone
 		}
