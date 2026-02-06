@@ -66,9 +66,17 @@ type Config struct {
 	Use32BitCRC bool
 	// AttnSequence: attention string for interrupting sender (max 32 bytes)
 	AttnSequence []byte
-	// RecvTimeout: idle timeout for reads from the remote (default 10s).
+	// RecvTimeout: idle timeout for reads from the remote.
+	//
+	// 0 disables deadline management. This is useful if the caller manages read
+	// deadlines externally (e.g. on net.Conn) or the transport provides its own
+	// timeout/cancellation mechanism.
+	//
+	// If Config is nil, RecvTimeout defaults to 10s.
+	//
 	// Effective only when the transport implements SetReadDeadline (e.g. net.Conn).
-	// When set, this overwrites any existing read deadline on the transport.
+	// When enabled (>0), this overwrites any existing read deadline on the transport
+	// while the session is running (cleared on exit).
 	// For transports without deadline support, callers must handle cancellation
 	// externally (e.g. by closing the transport).
 	RecvTimeout time.Duration
@@ -91,8 +99,8 @@ func (c *Config) defaults() {
 	if c.MaxBlockSize > 8192 {
 		c.MaxBlockSize = 8192
 	}
-	if c.RecvTimeout <= 0 {
-		c.RecvTimeout = 10 * time.Second
+	if c.RecvTimeout < 0 {
+		c.RecvTimeout = 0
 	}
 	if c.MaxRetries <= 0 {
 		c.MaxRetries = 10
@@ -130,6 +138,11 @@ func NewSession(transport io.ReadWriter, handler FileHandler, cfg *Config) *Sess
 		c = *cfg
 	}
 	c.defaults()
+	if cfg == nil && c.RecvTimeout == 0 {
+		// Keep the default behavior safe for net.Conn-like transports. If the caller
+		// supplies a Config explicitly, RecvTimeout=0 means "disabled".
+		c.RecvTimeout = 10 * time.Second
+	}
 
 	logger := slog.Default()
 

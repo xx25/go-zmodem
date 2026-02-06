@@ -10,17 +10,17 @@ import (
 type senderState int
 
 const (
-	stxInit       senderState = iota // Send ZRQINIT, wait for ZRINIT
-	stxSInit                         // Optional: send ZSINIT with Attn
-	stxFileInfo                      // Send ZFILE + file metadata subpacket
-	stxFileInfoAck                   // Wait for ZRPOS/ZSKIP/ZCRC
-	stxData                          // Send ZDATA header + data subpackets
-	stxEOF                           // Send ZEOF
-	stxEOFAck                        // Wait for ZRINIT (next file) or error
-	stxNextFile                      // Get next file from handler
-	stxFin                           // Send ZFIN
-	stxFinAck                        // Wait for ZFIN response, send OO
-	stxDone                          // Session complete
+	stxInit        senderState = iota // Send ZRQINIT, wait for ZRINIT
+	stxSInit                          // Optional: send ZSINIT with Attn
+	stxFileInfo                       // Send ZFILE + file metadata subpacket
+	stxFileInfoAck                    // Wait for ZRPOS/ZSKIP/ZCRC
+	stxData                           // Send ZDATA header + data subpackets
+	stxEOF                            // Send ZEOF
+	stxEOFAck                         // Wait for ZRINIT (next file) or error
+	stxNextFile                       // Get next file from handler
+	stxFin                            // Send ZFIN
+	stxFinAck                         // Wait for ZFIN response, send OO
+	stxDone                           // Session complete
 )
 
 // runSender implements the sender state machine.
@@ -267,8 +267,15 @@ func (s *Session) runSender(ctx context.Context) error {
 
 				// Window flow control: block when window is full
 				if s.remoteWindowSize > 0 && (fileOffset-lastAckOffset) >= int64(s.remoteWindowSize) {
-					// Solicit ZACK with zero-length ZCRCQ
-					if err := s.sendSubpacket(nil, ZCRCQ); err != nil {
+					// ZCRCQ is only valid when receiver advertises CANFDX (spec).
+					// Without CANFDX, fall back to ZCRCW (force response before next frame).
+					windowEndType := byte(ZCRCQ)
+					if !canFDX {
+						windowEndType = ZCRCW
+					}
+
+					// Solicit ZACK/ZRPOS with a zero-length subpacket.
+					if err := s.sendSubpacket(nil, windowEndType); err != nil {
 						return err
 					}
 					windowRetries := 0
@@ -279,8 +286,8 @@ func (s *Session) runSender(ctx context.Context) error {
 							if windowRetries >= s.cfg.MaxRetries {
 								return fmt.Errorf("zmodem: window flow control timeout after %d retries", windowRetries)
 							}
-							// Resend zero-length ZCRCQ
-							if err := s.sendSubpacket(nil, ZCRCQ); err != nil {
+							// Resend zero-length subpacket.
+							if err := s.sendSubpacket(nil, windowEndType); err != nil {
 								return err
 							}
 							continue
@@ -288,6 +295,11 @@ func (s *Session) runSender(ctx context.Context) error {
 						switch rxHdr.Type {
 						case ZACK:
 							lastAckOffset = rxHdr.Position()
+							if windowEndType == ZCRCW {
+								// ZCRCW ends the current data frame. Restart with a new ZDATA header.
+								state = stxData
+								sendLoop = true
+							}
 						case ZRPOS:
 							newPos := rxHdr.Position()
 							if err := s.seekFile(curOffer, newPos); err != nil {
@@ -302,6 +314,11 @@ func (s *Session) runSender(ctx context.Context) error {
 							sendLoop = true
 						default:
 							s.logger.Debug("unexpected frame in window wait", "type", frameTypeName(rxHdr.Type))
+							if windowEndType == ZCRCW {
+								// We already ended the frame; restart to re-sync the receiver.
+								state = stxData
+								sendLoop = true
+							}
 						}
 						break
 					}

@@ -162,7 +162,7 @@ type Config struct {
     Use32BitCRC bool
     // AttnSequence: attention string for interrupting sender (max 32 bytes)
     AttnSequence []byte
-    // RecvTimeout: timeout waiting for data from remote (default 10s)
+    // RecvTimeout: idle timeout waiting for data from remote (0 = disabled; default 10s if Config is nil)
     RecvTimeout time.Duration
     // Capabilities: receiver capability flags to advertise
     Capabilities byte
@@ -845,7 +845,7 @@ a wait, to guarantee network buffer flushing before resuming streaming.
 - [x] CRC error → purge transport buffer, then ZRPOS with last good offset
 - [x] ZRPOS recovery → next data frame uses ZCRCW (force ACK, guarantee flush)
 - [x] ZNAK → resend last header
-- [x] Timeout handling (receiver-driven timing, default 10s per Qodem)
+- [x] Timeout handling (receiver-driven timing; configurable idle timeout)
 - [x] Retry limits with configurable max attempts (default 10 for init, 25 for file transfer per Mystic)
 - [x] Garbage counter (default 1200 bytes, like lrzsz)
 - [x] Per-byte timeout in ZDLE escape decoding (prevent hang on dead sender)
