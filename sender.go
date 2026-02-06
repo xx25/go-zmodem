@@ -35,9 +35,10 @@ func (s *Session) runSender(ctx context.Context) error {
 		blockSize  int
 		goodBlocks int
 		goodNeeded int
-		unreliable bool
-		filesLeft  int
-		bytesLeft  int64
+		unreliable  bool
+		zcrcwNext   bool
+		filesLeft   int
+		bytesLeft   int64
 	)
 
 	blockSize = 256
@@ -254,6 +255,7 @@ func (s *Session) runSender(ctx context.Context) error {
 							blockSize = max(blockSize/4, 32)
 							goodBlocks = 0
 							unreliable = true
+							zcrcwNext = true
 							state = stxData
 							sendLoop = true
 							continue
@@ -310,6 +312,7 @@ func (s *Session) runSender(ctx context.Context) error {
 							blockSize = max(blockSize/4, 32)
 							goodBlocks = 0
 							unreliable = true
+							zcrcwNext = true
 							state = stxData
 							sendLoop = true
 						default:
@@ -339,6 +342,8 @@ func (s *Session) runSender(ctx context.Context) error {
 					// Choose end type
 					var endType byte
 					switch {
+					case zcrcwNext:
+						endType = ZCRCW
 					case atEOF:
 						endType = ZCRCE
 					case canFDX && subpacketCount > 0 && subpacketCount%zcrcqInterval == 0:
@@ -354,6 +359,38 @@ func (s *Session) runSender(ctx context.Context) error {
 					bytesSent = fileOffset
 					subpacketCount++
 					goodBlocks++
+
+					// If ZCRCW (post-ZRPOS flush), wait for ZACK then restart frame
+					if endType == ZCRCW {
+						zcrcwNext = false
+						rxHdr, err := s.recvHeader()
+						if err != nil {
+							if err == errAbortReceived {
+								return err
+							}
+							// Timeout or error — restart frame; receiver will ZRPOS again if needed.
+							state = stxData
+							sendLoop = true
+							continue
+						}
+						switch rxHdr.Type {
+						case ZACK:
+							lastAckOffset = rxHdr.Position()
+						case ZRPOS:
+							newPos := rxHdr.Position()
+							if err := s.seekFile(curOffer, newPos); err != nil {
+								return err
+							}
+							fileOffset = newPos
+							bytesSent = newPos
+							blockSize = max(blockSize/4, 32)
+							goodBlocks = 0
+						}
+						// ZCRCW ends the frame; restart with fresh ZDATA header
+						state = stxData
+						sendLoop = true
+						continue
+					}
 
 					// If ZCRCQ, read ZACK/ZRPOS response (bounded by RecvTimeout)
 					if endType == ZCRCQ {
@@ -384,6 +421,7 @@ func (s *Session) runSender(ctx context.Context) error {
 								blockSize = max(blockSize/4, 32)
 								goodBlocks = 0
 								unreliable = true
+								zcrcwNext = true
 								state = stxData
 								sendLoop = true
 							default:
@@ -461,6 +499,7 @@ func (s *Session) runSender(ctx context.Context) error {
 				blockSize = max(blockSize/4, 32)
 				goodBlocks = 0
 				unreliable = true
+				zcrcwNext = true
 				state = stxData
 			case ZNAK:
 				retries++
