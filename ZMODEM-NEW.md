@@ -75,7 +75,7 @@ Cross-referencing 8 historic documents (original Forsberg spec, YMODEM spec, Syn
 The plan was reviewed by Codex which identified 10 critical/important issues now incorporated below:
 
 1. **CRC-16 finalization** — ZMODEM CRC-16 requires feeding two zero bytes after data (lrzsz `updcrc(0, updcrc(0, crc))`). Bare `crc16.Checksum()` is WRONG.
-2. **Non-blocking reverse channel** — Sender must sample reverse channel without blocking; requires a dedicated goroutine.
+2. **Non-blocking reverse channel** — Sender must sample reverse channel without blocking; uses synchronous `peekForZPAD` (checks buffered bytes) + periodic ZCRCQ checkpoints to solicit ZACK/ZRPOS responses.
 3. **HEX header parity bits** — lrzsz sends LF as 0x8A (parity set), Tera Term sends CR as 0x8D. Reader must strip bit 7.
 4. **Write buffering** — Must use `bufio.Writer` internally; individual byte writes cause terrible syscall overhead.
 5. **Missing constants** — ZMSKNOLOC, ZMCHNG, ZBINR32, ZVBIN/ZVHEX/ZVBIN32/ZVBINR32, ZRESC must all be defined.
@@ -95,7 +95,7 @@ The plan was reviewed by Codex which identified 10 critical/important issues now
 4. **Streaming**: No buffering entire files — data flows through as it arrives
 5. **Explicit state machines**: Named states matching the spec (like bforce's ZTX_*/ZRX_* pattern)
 6. **Context-aware**: Support Go `context.Context` for cancellation and timeouts
-7. **Non-blocking reverse channel**: Sender uses a dedicated goroutine to read the reverse channel into a buffered channel, enabling non-blocking sampling during data transmission (like lrzsz's `rdchk()`)
+7. **Non-blocking reverse channel**: Sender samples the reverse channel synchronously between subpackets — no goroutines. `peekForZPAD()` checks already-buffered bytes for ZPAD/CAN (opportunistic, zero cost when nothing buffered). Periodic ZCRCQ checkpoints (when CANFDX is set) force a blocking read to discover ZRPOS/ZACK. Window flow control blocks when the receiver's advertised buffer is full.
 
 ### External Libraries
 
@@ -601,32 +601,41 @@ const (
 )
 ```
 
-**Reverse channel goroutine** (critical for streaming performance):
+**Reverse channel sampling** (synchronous, no goroutines):
 
-The sender spawns a goroutine that continuously reads from the transport and feeds
-received headers into a `chan Header`. The main sender loop checks this channel
-non-blocking (via `select` with `default`) after each data subpacket, like lrzsz's
-`rdchk()` call. This avoids blocking the sender on reverse channel I/O.
+The sender samples the reverse channel between subpackets using two mechanisms:
 
-```go
-// Inside Send():
-rxCh := make(chan Header, 4)
-go s.reverseChannelReader(ctx, rxCh) // reads transport, parses headers, sends to rxCh
-defer close(rxCh)
-```
+1. **`peekForZPAD()`**: Scans all bytes currently in the bufio buffer for ZPAD or CAN.
+   Purely opportunistic — if nothing is buffered, returns false immediately (zero cost).
+   When data is detected, calls `recvHeader()` to parse the incoming frame.
+
+2. **ZCRCQ checkpoints**: When the receiver advertises CANFDX, the sender periodically
+   emits ZCRCQ instead of ZCRCG to solicit a ZACK response. After sending a ZCRCQ
+   subpacket, the sender does a blocking `recvHeader()` (bounded by RecvTimeout) to
+   read the ZACK or ZRPOS. This is the reliable mechanism for discovering mid-stream
+   events.
+
+3. **Window flow control**: When `remoteWindowSize > 0` (from ZRINIT ZP0/ZP1) and
+   `(fileOffset - lastAckOffset) >= remoteWindowSize`, the sender blocks:
+   - CANFDX: send zero-length ZCRCQ subpacket, blocking read for ZACK/ZRPOS
+   - Non-FDX: send zero-length ZCRCW subpacket (ends frame), blocking read,
+     then restart with new ZDATA header
 
 **Data transmission loop** (stxData):
-1. Read block from file (up to MaxBlockSize)
-2. Choose subpacket end type:
-   - `ZCRCE` if EOF reached
-   - `ZCRCW` if error count high or buffer sync needed
-   - `ZCRCQ` if window management active
-   - `ZCRCG` otherwise (continuous streaming)
-3. Send subpacket via escapeWriter (buffered writes)
-4. Check rxCh non-blocking for ZRPOS/ZACK
-5. Handle ZRPOS: seek file (requires io.ReadSeeker), restart data frame
-6. Handle ZSKIP: advance to next file
-7. Call FileProgress periodically
+1. Check `ctx.Err()` for cancellation
+2. `peekForZPAD()` → if true, `recvHeader()`:
+   - ZRPOS → seek file, shrink blockSize, set `unreliable = true`, restart stxData
+   - ZACK → update `lastAckOffset`, continue
+   - abort → return error
+3. Window check: if `remoteWindowSize > 0` and window full, solicit ZACK (see above)
+4. Read file data (up to blockSize)
+5. Choose endType:
+   - EOF → ZCRCE
+   - CANFDX && every Nth subpacket → ZCRCQ (checkpoint)
+   - otherwise → ZCRCG
+6. `sendSubpacket(data, endType)`
+7. If ZCRCQ → blocking `recvHeader()` for ZACK/ZRPOS (with retry on timeout)
+8. Block size adaptation + progress callback
 
 **ZRPOS with non-seekable reader**:
 If the `FileOffer.Reader` does not implement `io.ReadSeeker` and the receiver sends
@@ -646,10 +655,15 @@ ZRPOS with offset > 0, the sender sends ZSKIP to skip the file (cannot resume).
   double `goodNeeded` (cap at 16). This aggressive reduction + slow recovery gives
   the most reliable behavior on noisy links.
 - Qodem uses a simpler variant: double after 8KB error-free, halve on error (min 32)
-- **Window management**: Use `ZCRCQ` (request ACK) every N blocks:
-  - Reliable link (no errors seen): every 32 blocks
-  - Unreliable link (any error seen): every 4 blocks
-  - The "unreliable" flag is one-way — once set, never goes back (Qodem pattern)
+- **ZCRCQ checkpoints** (gated on CANFDX): every 8 subpackets, emit ZCRCQ instead of
+  ZCRCG to solicit a ZACK. Blocking read after ZCRCQ, with retry (zero-length ZCRCQ
+  re-solicit) up to MaxRetries on timeout.
+- **Window flow control**: when receiver advertises non-zero buffer size in ZRINIT
+  (ZP0/ZP1 little-endian), sender blocks when `(fileOffset - lastAckOffset) >=
+  remoteWindowSize`. CANFDX → ZCRCQ solicit; non-FDX → ZCRCW (ends frame, restarts
+  with new ZDATA header).
+- `unreliable` flag: set on ZRPOS, never cleared. When true, `goodNeeded = 16`
+  instead of 8 (slower ramp-up after errors).
 
 **Auto-download trigger**:
 Before sending ZRQINIT, the sender should send the `"rz\r"` auto-download string.
@@ -727,32 +741,50 @@ indicated without erroring. Actual file length is determined by the data transfe
 #### Transport Reader (`reader.go`)
 
 ```go
-type transportReader struct {
-    r       io.Reader
-    buf     *bufio.Reader  // buffered reads to handle short reads
-    timeout time.Duration
+type deadlineSetter interface {
+    SetReadDeadline(time.Time) error
 }
 
-// ReadByte reads one raw byte with timeout.
-// Handles transports that return short reads correctly.
-func (tr *transportReader) ReadByte() (byte, error)
+type transportReader struct {
+    r            *bufio.Reader  // 4096-byte buffered reader
+    ds           deadlineSetter // nil if transport lacks deadline support
+    timeout      time.Duration  // idle timeout (from Config.RecvTimeout)
+    garbageCount int
+    garbageMax   int
+    canCount     int            // consecutive CAN chars (5× = abort)
+    logger       *slog.Logger
+}
 
-// ReadZDLE reads one ZDLE-decoded byte (handles escapes, strips XON/XOFF).
-// Has per-byte timeout for the second byte of a ZDLE escape sequence,
-// preventing infinite hang if sender dies mid-escape.
-func (tr *transportReader) ReadZDLE() (byte, bool, error)
-// Returns: (byte, isSpecial, error)
-// isSpecial=true for ZCRCE/ZCRCG/ZCRCQ/ZCRCW
+func newTransportReader(r io.Reader, garbageMax int, timeout time.Duration, logger *slog.Logger) *transportReader
+// Type-asserts r to deadlineSetter before wrapping in bufio.Reader.
 
-// ReadHex reads two hex digits and returns the byte value.
-// Strips parity bit (mask 0x7F) per lrzsz noxrd7() convention.
-func (tr *transportReader) ReadHex() (byte, error)
+// readByte is the single choke point for all blocking transport reads.
+// Sets idle deadline (now + timeout) only when bufio buffer is empty,
+// transport supports deadlines, and timeout > 0. When Buffered() > 0,
+// data is already available — no deadline needed.
+func (tr *transportReader) readByte() (byte, error)
 
-// ScanForPad scans input for ZPAD (frame start), discarding other data.
+// readByteStrip routes through readByte(), stripping XON/XOFF and parity variants.
+func (tr *transportReader) readByteStrip() (byte, error)
+
+// peekForZPAD scans all buffered bytes for ZPAD or CAN. Non-blocking,
+// opportunistic — returns false immediately if nothing is buffered.
+// Used by sender for reverse channel sampling between subpackets.
+func (tr *transportReader) peekForZPAD() bool
+
+// clearDeadline resets the transport's read deadline to zero.
+// Called in Send()/Receive() defer to clean up stale deadlines.
+// Only acts when timeout > 0 (doesn't clobber caller-managed deadlines).
+func (tr *transportReader) clearDeadline()
+
+// zdlRead reads one ZDLE-decoded byte (handles escapes, strips XON/XOFF).
+func (tr *transportReader) zdlRead() (byte, error)
+
+// scanForPad scans input for ZPAD (frame start), discarding other data.
 // Returns the encoding byte that follows (ZBIN, ZHEX, ZBIN32).
-// Returns error for ZBINR32, ZVBIN, ZVHEX, etc. (unsupported encodings).
 // Tracks garbage count and returns error if threshold exceeded.
-func (tr *transportReader) ScanForPad() (byte, error)
+// Detects 5× CAN abort sequence.
+func (tr *transportReader) scanForPad() (byte, error)
 ```
 
 #### Transport Writer (`writer.go`)
@@ -833,7 +865,7 @@ var abortSequence = []byte{
 
 ### Streaming Modes (Must Have)
 Per Forsberg spec Chapter 9, four distinct streaming modes exist:
-- [x] **Full streaming with sampling** (ZCRCG + non-blocking reverse channel goroutine) — primary mode
+- [x] **Full streaming with sampling** (ZCRCG + synchronous `peekForZPAD` between subpackets) — primary mode
 - [x] **Full streaming with reverse interrupt** (Attn sequence to interrupt sender) — for systems that can't sample
 - [x] **Full streaming with sliding window** (ZCRCQ to elicit ZACKs, measure window) — for buffering systems
 - [x] **Segmented streaming** (ZCRCW for receivers without overlapped I/O, uses receiver buffer size from ZRINIT)
@@ -889,7 +921,7 @@ a wait, to guarantee network buffer flushing before resuming streaming.
 2. `crc.go` — CRC-16 with 2-zero-byte finalization, CRC-32 with verify magic, **unit tests for CRC correctness against known lrzsz test vectors**
 3. `escape.go` + `escape_test.go` — ZDLE encode/decode with round-trip tests, lastSent tracking for @-CR
 4. `writer.go` — buffered transport writer (`bufio.Writer` backed), escape layer, flush at boundaries
-5. `reader.go` — buffered transport reader, ZDLE reading, parity stripping, frame scanning, garbage counter, **reverse channel reader goroutine infrastructure**
+5. `reader.go` — buffered transport reader with idle-timeout deadlines (`deadlineSetter`), ZDLE reading, parity stripping, frame scanning, garbage counter, `peekForZPAD` for reverse channel sampling
 
 ### Phase 2: Protocol Messages
 6. `zmodem.go` — Session struct, Config, public API types (needed by frame.go and sender/receiver)
@@ -898,9 +930,9 @@ a wait, to guarantee network buffer flushing before resuming streaming.
 9. `fileinfo.go` + `fileinfo_test.go` — ZFILE metadata parse/marshal, SanitizeFilename helper
 
 ### Phase 3: State Machines + Early Testing
-10. `sender.go` — sender state machine (12 states) with reverse channel goroutine
+10. `sender.go` — sender state machine (12 states) with synchronous reverse channel sampling + ZCRCQ checkpoints
 11. `receiver.go` — receiver state machine (9 states)
-12. `loopback_test.go` — sender↔receiver through `io.Pipe()` — **start testing ASAP**, don't wait until Phase 4
+12. `loopback_test.go` — sender↔receiver through buffered channel transport (`newTestTransports()`) — **start testing ASAP**, don't wait until Phase 4. Use `net.Pipe()` only when deadline support is needed (e.g., RecvTimeout test).
 
 ### Phase 4: Interop Testing
 13. `cmd/zmodem-test/main.go` — CLI tool for interop testing with `sz`/`rz` (lrzsz)
@@ -1004,8 +1036,8 @@ All output goes through `bufio.Writer`. Without this, per-byte syscall overhead 
 ## Testing Strategy
 
 1. **Unit tests**: escape round-trip, frame round-trip, file info parsing, **CRC correctness against known lrzsz values**
-2. **Loopback test**: sender↔receiver through `io.Pipe()` — verifies complete protocol flow. **Start in Phase 3, not Phase 4**.
-3. **Interop tests**: against lrzsz `sz`/`rz` through PTY — verifies real-world compatibility
+2. **Loopback test**: sender↔receiver through buffered channel transport (`newTestTransports()`) — avoids `net.Pipe()` deadlocks (synchronous/unbuffered). Use `net.Pipe()` only for deadline-specific tests. **Start in Phase 3, not Phase 4**.
+3. **Interop tests**: against lrzsz `sz`/`rz` through TCP sockets — verifies real-world compatibility
 4. **Byte trace methodology** (from Stack Overflow): capture exact byte sequences from lrzsz transfers and compare against library output byte-by-byte. This is the most effective debugging technique.
 5. **Edge cases**:
    - File containing only ZDLE bytes (worst-case escaping)
