@@ -852,6 +852,235 @@ func TestLoopbackWindowFlowControl(t *testing.T) {
 	}
 }
 
+func TestLoopbackResume(t *testing.T) {
+	senderTransport, receiverTransport, senderClose, receiverClose := newTestTransports()
+
+	testContent := make([]byte, 4096)
+	rand.Read(testContent)
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{
+			Name:   "resume.bin",
+			Size:   int64(len(testContent)),
+			Reader: bytes.NewReader(testContent),
+		},
+	}
+
+	receiverHandler := newTestHandler()
+	receiverHandler.acceptOffset = 1024 // resume from byte 1024
+
+	sender := NewSession(senderTransport, senderHandler, &Config{MaxBlockSize: 512})
+	receiver := NewSession(receiverTransport, receiverHandler, &Config{MaxBlockSize: 512})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer senderClose()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer receiverClose()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+
+	received, ok := receiverHandler.receivedFiles["resume.bin"]
+	if !ok {
+		t.Fatal("resume.bin not received")
+	}
+	// Only data from offset 1024 onwards should be in the buffer
+	if !bytes.Equal(received.Bytes(), testContent[1024:]) {
+		t.Errorf("content mismatch: got %d bytes, want %d bytes",
+			received.Len(), len(testContent)-1024)
+	}
+	if err := receiverHandler.completedFiles["resume.bin"]; err != nil {
+		t.Errorf("unexpected completion error: %v", err)
+	}
+}
+
+func TestLoopbackMaxFileSize(t *testing.T) {
+	senderTransport, receiverTransport, senderClose, receiverClose := newTestTransports()
+
+	smallContent := []byte("small file content here")
+	bigContent := make([]byte, 5000)
+	rand.Read(bigContent)
+	mediumContent := []byte("medium file — should be received just fine!!")
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{Name: "small.txt", Size: int64(len(smallContent)), Reader: bytes.NewReader(smallContent)},
+		{Name: "big.bin", Size: int64(len(bigContent)), Reader: bytes.NewReader(bigContent)},
+		{Name: "medium.txt", Size: int64(len(mediumContent)), Reader: bytes.NewReader(mediumContent)},
+	}
+
+	receiverHandler := newTestHandler()
+
+	sender := NewSession(senderTransport, senderHandler, nil)
+	receiver := NewSession(receiverTransport, receiverHandler, &Config{MaxFileSize: 1000})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer senderClose()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer receiverClose()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+
+	// small and medium should be received
+	if received, ok := receiverHandler.receivedFiles["small.txt"]; !ok {
+		t.Error("small.txt not received")
+	} else if !bytes.Equal(received.Bytes(), smallContent) {
+		t.Error("small.txt content mismatch")
+	}
+
+	if received, ok := receiverHandler.receivedFiles["medium.txt"]; !ok {
+		t.Error("medium.txt not received")
+	} else if !bytes.Equal(received.Bytes(), mediumContent) {
+		t.Error("medium.txt content mismatch")
+	}
+
+	// big file should NOT be received
+	if _, ok := receiverHandler.receivedFiles["big.bin"]; ok {
+		t.Error("big.bin should not have been received (exceeds MaxFileSize)")
+	}
+
+	// Sender should see ErrSkip for big file
+	senderHandler.mu.Lock()
+	defer senderHandler.mu.Unlock()
+	if err := senderHandler.completedFiles["big.bin"]; err != ErrSkip {
+		t.Errorf("expected ErrSkip for big.bin, got: %v", err)
+	}
+}
+
+// readOnly wraps a reader to strip io.ReadSeeker, exposing only io.Reader.
+type readOnly struct{ io.Reader }
+
+func TestLoopbackNonSeekableZRPOS(t *testing.T) {
+	senderTransport, receiverTransport, senderClose, receiverClose := newTestTransports()
+
+	content1 := make([]byte, 2048)
+	rand.Read(content1)
+	content2 := make([]byte, 2048)
+	rand.Read(content2)
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{
+			Name:   "nonseek.bin",
+			Size:   int64(len(content1)),
+			Reader: readOnly{bytes.NewReader(content1)}, // NOT seekable
+		},
+		{
+			Name:   "seekable.bin",
+			Size:   int64(len(content2)),
+			Reader: bytes.NewReader(content2), // seekable
+		},
+	}
+
+	receiverHandler := newTestHandler()
+	receiverHandler.acceptOffset = 512 // forces non-zero ZRPOS
+
+	sender := NewSession(senderTransport, senderHandler, &Config{MaxBlockSize: 512})
+	receiver := NewSession(receiverTransport, receiverHandler, &Config{MaxBlockSize: 512})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer senderClose()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer receiverClose()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	// Sender should report error for non-seekable file
+	senderHandler.mu.Lock()
+	defer senderHandler.mu.Unlock()
+	if err := senderHandler.completedFiles["nonseek.bin"]; err == nil {
+		t.Error("expected sender error for nonseek.bin, got nil")
+	} else if !strings.Contains(err.Error(), "not seekable") {
+		t.Errorf("expected 'not seekable' error, got: %v", err)
+	}
+
+	// Receiver should mark file 1 as completed with ErrSkip, buffer empty
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+	if err := receiverHandler.completedFiles["nonseek.bin"]; err != ErrSkip {
+		t.Errorf("expected receiver ErrSkip for nonseek.bin, got: %v", err)
+	}
+	if buf, ok := receiverHandler.receivedFiles["nonseek.bin"]; ok && buf.Len() != 0 {
+		t.Errorf("expected empty buffer for nonseek.bin, got %d bytes", buf.Len())
+	}
+
+	// File 2 should be received (from offset 512 onwards)
+	received, ok := receiverHandler.receivedFiles["seekable.bin"]
+	if !ok {
+		t.Fatal("seekable.bin not received")
+	}
+	if !bytes.Equal(received.Bytes(), content2[512:]) {
+		t.Errorf("seekable.bin content mismatch: got %d bytes, want %d bytes",
+			received.Len(), len(content2)-512)
+	}
+}
+
 // snoopingWriter wraps a writer and calls onByte for each consecutive byte pair.
 type snoopingWriter struct {
 	w      io.Writer

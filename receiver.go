@@ -265,6 +265,13 @@ func (s *Session) runReceiver(ctx context.Context) error {
 				s.handler.FileCompleted(curInfo, bytesReceived, fmt.Errorf("session ended prematurely"))
 				state = srxFin
 
+			case ZSKIP:
+				// Sender cannot fulfil our ZRPOS (e.g. non-seekable reader).
+				closeWriter(curWriter)
+				curWriter = nil
+				s.handler.FileCompleted(curInfo, bytesReceived, ErrSkip)
+				state = srxFileWait
+
 			default:
 				s.logger.Warn("unexpected frame in data state", "type", frameTypeName(hdr.Type))
 			}

@@ -24,9 +24,8 @@ func findBinary(t *testing.T, name string) string {
 	return path
 }
 
-// startRzReceiver launches rz --tcp-client connecting to a TCP listener.
-// Returns the accepted connection and the exec.Cmd. The caller must wait on cmd.
-func startRzReceiver(t *testing.T, tempDir string, extraFlags []string) (net.Conn, *exec.Cmd) {
+// startRzReceiverWithBaseFlags launches rz with the given base flags plus extraFlags.
+func startRzReceiverWithBaseFlags(t *testing.T, tempDir string, baseFlags, extraFlags []string) (net.Conn, *exec.Cmd) {
 	t.Helper()
 	rzPath := findBinary(t, "rz")
 
@@ -38,7 +37,8 @@ func startRzReceiver(t *testing.T, tempDir string, extraFlags []string) (net.Con
 	port := ln.Addr().(*net.TCPAddr).Port
 	addr := fmt.Sprintf("localhost:%d", port)
 
-	args := []string{"--tcp-client", addr, "-b", "-Z", "-q", "-O"}
+	args := []string{"--tcp-client", addr}
+	args = append(args, baseFlags...)
 	args = append(args, extraFlags...)
 
 	cmd := exec.Command(rzPath, args...)
@@ -66,6 +66,18 @@ func startRzReceiver(t *testing.T, tempDir string, extraFlags []string) (net.Con
 	ln.Close()
 
 	return conn, cmd
+}
+
+// startRzReceiver launches rz --tcp-client in overwrite mode.
+func startRzReceiver(t *testing.T, tempDir string, extraFlags []string) (net.Conn, *exec.Cmd) {
+	t.Helper()
+	return startRzReceiverWithBaseFlags(t, tempDir, []string{"-b", "-Z", "-q", "-O"}, extraFlags)
+}
+
+// startRzReceiverResume launches rz --tcp-client in resume/crash-recovery mode.
+func startRzReceiverResume(t *testing.T, tempDir string, extraFlags []string) (net.Conn, *exec.Cmd) {
+	t.Helper()
+	return startRzReceiverWithBaseFlags(t, tempDir, []string{"-b", "-Z", "-q", "-r"}, extraFlags)
 }
 
 // startSzSender launches sz --tcp-client connecting to a TCP listener.
@@ -143,6 +155,7 @@ type lrzszFileHandler struct {
 	files     []*FileOffer
 	sendIdx   int
 	completed map[string]error
+	skipFiles map[string]bool
 }
 
 func newLrzszSendHandler(files []*FileOffer) *lrzszFileHandler {
@@ -156,6 +169,7 @@ func newLrzszRecvHandler(dir string) *lrzszFileHandler {
 	return &lrzszFileHandler{
 		dir:       dir,
 		completed: make(map[string]error),
+		skipFiles: make(map[string]bool),
 	}
 }
 
@@ -170,6 +184,9 @@ func (h *lrzszFileHandler) NextFile() *FileOffer {
 
 func (h *lrzszFileHandler) AcceptFile(info FileInfo) (io.WriteCloser, int64, error) {
 	name := SanitizeFilename(info.Name)
+	if h.skipFiles[name] {
+		return nil, 0, ErrSkip
+	}
 	path := filepath.Join(h.dir, name)
 	f, err := os.Create(path)
 	if err != nil {
@@ -642,4 +659,104 @@ func TestLrzszB6_RecvEscapeAll(t *testing.T) {
 	}
 
 	verifyFile(t, filepath.Join(recvDir, "escaped.bin"), content)
+}
+
+// ==== Group A: Additional Tests ====
+
+func TestLrzszA8_SendResume(t *testing.T) {
+	recvDir := t.TempDir()
+
+	// 8KB test content
+	fullContent := make([]byte, 8192)
+	rand.Read(fullContent)
+
+	// Pre-create a partial file (first 2048 bytes) to simulate interrupted transfer
+	partialPath := filepath.Join(recvDir, "resume.bin")
+	if err := os.WriteFile(partialPath, fullContent[:2048], 0644); err != nil {
+		t.Fatalf("write partial file: %v", err)
+	}
+
+	// Start rz in resume mode (-r instead of -O)
+	conn, cmd := startRzReceiverResume(t, recvDir, nil)
+	defer conn.Close()
+
+	handler := newLrzszSendHandler([]*FileOffer{
+		{
+			Name:   "resume.bin",
+			Size:   int64(len(fullContent)),
+			Reader: bytes.NewReader(fullContent),
+		},
+	})
+
+	session := NewSession(conn, handler, &Config{MaxBlockSize: 1024})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := session.Send(ctx); err != nil {
+		t.Fatalf("Send error: %v", err)
+	}
+	conn.Close()
+
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("rz exit error: %v", err)
+	}
+
+	verifyFile(t, partialPath, fullContent)
+}
+
+// ==== Group B: Additional Tests ====
+
+func TestLrzszB7_RecvSkipInBatch(t *testing.T) {
+	srcDir := t.TempDir()
+	recvDir := t.TempDir()
+
+	files := []struct {
+		name    string
+		content []byte
+	}{
+		{"keep1.txt", []byte("First file — should be received")},
+		{"skip_me.txt", []byte("This file should be skipped by the Go receiver")},
+		{"keep2.txt", []byte("Third file — should also be received")},
+	}
+
+	var paths []string
+	for _, f := range files {
+		p := createTestFile(t, srcDir, f.name, f.content)
+		paths = append(paths, p)
+	}
+
+	conn, cmd := startSzSender(t, paths, nil)
+	defer conn.Close()
+
+	handler := newLrzszRecvHandler(recvDir)
+	handler.skipFiles["skip_me.txt"] = true
+
+	session := NewSession(conn, handler, &Config{MaxBlockSize: 1024})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := session.Receive(ctx); err != nil {
+		t.Fatalf("Receive error: %v", err)
+	}
+	conn.Close()
+
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("sz exit error: %v", err)
+	}
+
+	// Verify kept files
+	verifyFile(t, filepath.Join(recvDir, "keep1.txt"), files[0].content)
+	verifyFile(t, filepath.Join(recvDir, "keep2.txt"), files[2].content)
+
+	// Verify skipped file was NOT written to disk
+	if _, err := os.Stat(filepath.Join(recvDir, "skip_me.txt")); err == nil {
+		t.Error("skip_me.txt should not exist on disk")
+	}
+
+	// Verify completion status
+	if err := handler.completed["skip_me.txt"]; err != ErrSkip {
+		t.Errorf("expected ErrSkip for skip_me.txt, got: %v", err)
+	}
 }
