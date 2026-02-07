@@ -9,25 +9,25 @@ const writerBufSize = 4096
 
 // transportWriter wraps an io.Writer with buffering and ZDLE escaping.
 type transportWriter struct {
-	w         *bufio.Writer
-	table     [256]byte
-	lastSent  byte
-	escapeAll bool
+	w          *bufio.Writer
+	table      [256]byte
+	lastSent   byte
+	escapeMode EscapeMode
 }
 
-func newTransportWriter(w io.Writer, escapeAll bool) *transportWriter {
+func newTransportWriter(w io.Writer, mode EscapeMode) *transportWriter {
 	tw := &transportWriter{
-		w:         bufio.NewWriterSize(w, writerBufSize),
-		escapeAll: escapeAll,
+		w:          bufio.NewWriterSize(w, writerBufSize),
+		escapeMode: mode,
 	}
-	tw.table = buildEscapeTable(escapeAll)
+	tw.table = buildEscapeTable(mode)
 	return tw
 }
 
-// setEscapeAll changes the escape mode and rebuilds the table.
-func (tw *transportWriter) setEscapeAll(escapeAll bool) {
-	tw.escapeAll = escapeAll
-	tw.table = buildEscapeTable(escapeAll)
+// setEscapeMode changes the escape mode and rebuilds the table.
+func (tw *transportWriter) setEscapeMode(mode EscapeMode) {
+	tw.escapeMode = mode
+	tw.table = buildEscapeTable(mode)
 }
 
 // Flush writes buffered data to the underlying transport.

@@ -5,7 +5,7 @@ import (
 )
 
 func TestBuildEscapeTable(t *testing.T) {
-	table := buildEscapeTable(false)
+	table := buildEscapeTable(EscapeStandard)
 
 	// Must-escape characters
 	mustEscape := []byte{ZDLE, 0x10, XON, XOFF, 0x90, 0x91, 0x93, 0x98}
@@ -27,7 +27,7 @@ func TestBuildEscapeTable(t *testing.T) {
 }
 
 func TestBuildEscapeTableAll(t *testing.T) {
-	table := buildEscapeTable(true)
+	table := buildEscapeTable(EscapeAll)
 
 	// All control chars (except CR which is escIfAtCR) should be escMust
 	for i := 0; i < 32; i++ {
@@ -50,8 +50,27 @@ func TestBuildEscapeTableAll(t *testing.T) {
 	}
 }
 
+func TestBuildEscapeTableMinimal(t *testing.T) {
+	table := buildEscapeTable(EscapeMinimal)
+
+	// Only ZDLE should be escMust
+	if table[ZDLE] != escMust {
+		t.Errorf("ZDLE (0x18) should be escMust, got %d", table[ZDLE])
+	}
+
+	// Everything else should be escSend (no escaping)
+	for i := 0; i < 256; i++ {
+		if byte(i) == ZDLE {
+			continue
+		}
+		if table[i] != escSend {
+			t.Errorf("byte 0x%02x should be escSend in minimal mode, got %d", i, table[i])
+		}
+	}
+}
+
 func TestEscapeRequired(t *testing.T) {
-	table := buildEscapeTable(false)
+	table := buildEscapeTable(EscapeStandard)
 
 	// ZDLE always needs escape
 	if !escapeRequired(&table, ZDLE, 0) {

@@ -90,7 +90,7 @@ func (s *Session) runReceiver(ctx context.Context) error {
 
 				// Process ZSINIT flags
 				if (hdr.ZF0() & TESCCTL) != 0 {
-					s.tw.setEscapeAll(true)
+					s.tw.setEscapeMode(EscapeAll)
 				}
 
 				// Send ZACK
@@ -371,7 +371,7 @@ func (s *Session) sendZRINIT() error {
 	if s.cfg.Use32BitCRC {
 		caps |= CANFC32
 	}
-	if s.cfg.EscapeAll {
+	if s.cfg.EscapeMode == EscapeAll {
 		caps |= ESCCTL
 	}
 	caps |= s.cfg.Capabilities

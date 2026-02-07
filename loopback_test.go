@@ -1096,3 +1096,76 @@ func (sw *snoopingWriter) Write(p []byte) (int, error) {
 	return sw.w.Write(p)
 }
 
+func TestLoopbackDirZap(t *testing.T) {
+	senderTransport, receiverTransport, senderClose, receiverClose := newTestTransports()
+
+	// Build test data that contains XON (0x11), XOFF (0x13), and other
+	// control chars that standard ZMODEM would strip or escape.
+	testContent := make([]byte, 16384)
+	rand.Read(testContent)
+	// Sprinkle XON/XOFF bytes throughout
+	for i := 0; i < len(testContent); i += 64 {
+		testContent[i] = XON
+		if i+1 < len(testContent) {
+			testContent[i+1] = XOFF
+		}
+	}
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{
+			Name:   "dirzap.bin",
+			Size:   int64(len(testContent)),
+			Reader: bytes.NewReader(testContent),
+		},
+	}
+
+	receiverHandler := newTestHandler()
+
+	// DirZap: 8K blocks, minimal escaping
+	senderCfg := &Config{MaxBlockSize: 8192, EscapeMode: EscapeMinimal}
+	receiverCfg := &Config{MaxBlockSize: 8192, EscapeMode: EscapeMinimal}
+
+	sender := NewSession(senderTransport, senderHandler, senderCfg)
+	receiver := NewSession(receiverTransport, receiverHandler, receiverCfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer senderClose()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer receiverClose()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+
+	received, ok := receiverHandler.receivedFiles["dirzap.bin"]
+	if !ok {
+		t.Fatal("dirzap.bin not received")
+	}
+	if !bytes.Equal(received.Bytes(), testContent) {
+		t.Errorf("content mismatch: got %d bytes, want %d bytes",
+			received.Len(), len(testContent))
+	}
+}
+

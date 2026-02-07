@@ -60,8 +60,8 @@ type Config struct {
 	MaxBlockSize int
 	// WindowSize: streaming window size (0 = full streaming, >0 = windowed)
 	WindowSize int
-	// EscapeAll: escape all control characters (for hostile transports)
-	EscapeAll bool
+	// EscapeMode controls ZDLE escaping: EscapeStandard (default), EscapeAll, or EscapeMinimal (DirZap).
+	EscapeMode EscapeMode
 	// Use32BitCRC: prefer CRC-32 when receiver supports it
 	Use32BitCRC bool
 	// AttnSequence: attention string for interrupting sender (max 32 bytes)
@@ -151,8 +151,8 @@ func NewSession(transport io.ReadWriter, handler FileHandler, cfg *Config) *Sess
 		handler:   handler,
 		cfg:       c,
 		logger:    logger,
-		tw:        newTransportWriter(transport, c.EscapeAll),
-		tr:        newTransportReader(transport, c.GarbageThreshold, c.RecvTimeout, logger),
+		tw:        newTransportWriter(transport, c.EscapeMode),
+		tr:        newTransportReader(transport, c.GarbageThreshold, c.RecvTimeout, c.EscapeMode != EscapeMinimal, logger),
 	}
 	return s
 }

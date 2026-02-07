@@ -7,12 +7,17 @@ const (
 	escIfAtCR  = 2 // escape only if preceded by '@' (CR protection)
 )
 
-// buildEscapeTable builds the ZDLE escape lookup table.
-// escapeAll: escape all control characters (for hostile transports).
-func buildEscapeTable(escapeAll bool) [256]byte {
+// buildEscapeTable builds the ZDLE escape lookup table for the given mode.
+func buildEscapeTable(mode EscapeMode) [256]byte {
 	var table [256]byte
 
-	// Always escape these regardless of mode:
+	if mode == EscapeMinimal {
+		// DirZap: escape only ZDLE itself
+		table[ZDLE] = escMust // 0x18
+		return table
+	}
+
+	// Standard and EscapeAll share the base set:
 	// ZDLE (0x18), DLE (0x10), XON (0x11), XOFF (0x13)
 	// and their high-bit variants (0x90, 0x91, 0x93, 0x98)
 	table[ZDLE] = escMust  // 0x18
@@ -28,7 +33,7 @@ func buildEscapeTable(escapeAll bool) [256]byte {
 	table[0x0d] = escIfAtCR
 	table[0x8d] = escIfAtCR
 
-	if escapeAll {
+	if mode == EscapeAll {
 		// Escape all characters with bits 5+6 both zero (control chars 0x00-0x1F)
 		// and their high-bit variants (0x80-0x9F).
 		// Note: 0x7F (DEL) and 0xFF are NOT escaped — they have bits 5+6 set

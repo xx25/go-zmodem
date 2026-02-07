@@ -217,7 +217,7 @@ func (r *receiver) AcceptFile(info zmodem.FileInfo) (io.WriteCloser, int64, erro
 |--------------------|---------|-----------------------------------------------------|
 | `MaxBlockSize`     | 1024    | Data subpacket size (max 8192)                      |
 | `WindowSize`       | 0       | Streaming window size (0 = full streaming)          |
-| `EscapeAll`        | false   | Escape all control characters                       |
+| `EscapeMode`       | `EscapeStandard` | ZDLE escaping mode: `EscapeStandard`, `EscapeAll`, `EscapeMinimal` |
 | `Use32BitCRC`      | false   | Prefer CRC-32 when receiver supports it             |
 | `AttnSequence`     | nil     | Attention string for interrupting sender (max 32 B) |
 | `RecvTimeout`      | 10s     | Idle timeout for reads (0 = disabled)               |

@@ -450,7 +450,7 @@ func TestLrzszA7_SendEscapeAll(t *testing.T) {
 	})
 
 	session := NewSession(conn, handler, &Config{
-		EscapeAll:    true,
+		EscapeMode:   EscapeAll,
 		MaxBlockSize: 1024,
 	})
 
@@ -642,7 +642,7 @@ func TestLrzszB6_RecvEscapeAll(t *testing.T) {
 
 	handler := newLrzszRecvHandler(recvDir)
 	session := NewSession(conn, handler, &Config{
-		EscapeAll:    true,
+		EscapeMode:   EscapeAll,
 		MaxBlockSize: 1024,
 	})
 

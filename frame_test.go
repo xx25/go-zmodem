@@ -10,8 +10,8 @@ func TestHexHeaderRoundTrip(t *testing.T) {
 	// Create a pipe-like transport using bytes.Buffer
 	var buf bytes.Buffer
 
-	tw := newTransportWriter(&buf, false)
-	tr := newTransportReader(&buf, 1200, 0, slog.Default())
+	tw := newTransportWriter(&buf, EscapeStandard)
+	tr := newTransportReader(&buf, 1200, 0, true, slog.Default())
 
 	s := &Session{
 		tw:     tw,
@@ -62,8 +62,8 @@ func TestBinHeaderRoundTripCRC16(t *testing.T) {
 	var buf bytes.Buffer
 
 	s := &Session{
-		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
+		tw:       newTransportWriter(&buf, EscapeStandard),
+		tr:       newTransportReader(&buf, 1200, 0, true, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: false,
 	}
@@ -94,8 +94,8 @@ func TestBinHeaderRoundTripCRC32(t *testing.T) {
 	var buf bytes.Buffer
 
 	s := &Session{
-		tw:       newTransportWriter(&buf, false),
-		tr:       newTransportReader(&buf, 1200, 0, slog.Default()),
+		tw:       newTransportWriter(&buf, EscapeStandard),
+		tr:       newTransportReader(&buf, 1200, 0, true, slog.Default()),
 		logger:   slog.Default(),
 		useCRC32: true,
 	}
@@ -170,8 +170,8 @@ func TestHexHeaderLowercaseDigits(t *testing.T) {
 	var buf bytes.Buffer
 
 	s := &Session{
-		tw:     newTransportWriter(&buf, false),
-		tr:     newTransportReader(&buf, 1200, 0, slog.Default()),
+		tw:     newTransportWriter(&buf, EscapeStandard),
+		tr:     newTransportReader(&buf, 1200, 0, true, slog.Default()),
 		logger: slog.Default(),
 	}
 
