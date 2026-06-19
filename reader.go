@@ -172,6 +172,15 @@ func hexVal(b byte) (byte, bool) {
 // Tracks garbage count and returns error if threshold exceeded.
 func (tr *transportReader) scanForPad() (byte, error) {
 	tr.canCount = 0
+	// garbageMax is the budget for ONE header hunt, not a session lifetime
+	// total. Resetting it here lets each scan skip up to garbageMax bytes of
+	// noise looking for a frame start. Without this reset the counter latches
+	// after the first overflow and every later scan trips the threshold on its
+	// first byte, so mid-stream resync (drain the in-flight backlog after a
+	// data error, then catch the peer's ZRPOS/ZDATA) becomes impossible: the
+	// receiver's retry budget is spent in milliseconds instead of spanning the
+	// round-trips the drain actually needs.
+	tr.garbageCount = 0
 
 	for {
 		b, err := tr.readByte()

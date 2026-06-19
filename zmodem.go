@@ -12,6 +12,14 @@ import (
 // ErrSkip is returned by AcceptFile to skip a file.
 var ErrSkip = errors.New("skip file")
 
+// DefaultRecvTimeout is the idle read timeout applied when NewSession is
+// called with a nil Config. It is exported so callers that synthesize a
+// Config (e.g. to inject a logger) can replicate the nil-config behaviour
+// exactly: a supplied Config{RecvTimeout: 0} means "disabled", so a caller
+// turning nil into an explicit Config must seed this value or it would
+// silently lose the read timeout.
+const DefaultRecvTimeout = 10 * time.Second
+
 // FileHandler is the application callback interface for file operations.
 type FileHandler interface {
 	// NextFile returns the next file to send, or nil if no more files.
@@ -90,6 +98,11 @@ type Config struct {
 	GarbageThreshold int
 	// Znulls: number of null bytes before ZDATA headers (default 0)
 	Znulls int
+	// Logger: optional structured logger for frame traces (recv/send headers,
+	// ZDATA position mismatches, ZRPOS resync, garbage-skip diagnostics). When
+	// nil, slog.Default() is used. Lets the caller route the protocol-level
+	// trace into the same stream as its transport/byte trace.
+	Logger *slog.Logger
 }
 
 func (c *Config) defaults() {
@@ -141,10 +154,13 @@ func NewSession(transport io.ReadWriter, handler FileHandler, cfg *Config) *Sess
 	if cfg == nil && c.RecvTimeout == 0 {
 		// Keep the default behavior safe for net.Conn-like transports. If the caller
 		// supplies a Config explicitly, RecvTimeout=0 means "disabled".
-		c.RecvTimeout = 10 * time.Second
+		c.RecvTimeout = DefaultRecvTimeout
 	}
 
 	logger := slog.Default()
+	if c.Logger != nil {
+		logger = c.Logger
+	}
 
 	s := &Session{
 		transport: transport,

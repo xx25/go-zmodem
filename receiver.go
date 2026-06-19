@@ -20,6 +20,14 @@ const (
 	srxDone                            // Session complete
 )
 
+// dataRetryBudget is the maximum number of failed recvHeader attempts the
+// data phase (srxData) tolerates before aborting "max retries exceeded during
+// data transfer". Higher than the file-wait MaxRetries per Mystic, because a
+// single mid-stream data error must be recoverable: each retry purges and
+// re-sends ZRPOS, and the in-flight backlog the receiver drains while hunting
+// for the peer's resync frame can span several of these attempts.
+const dataRetryBudget = 25
+
 // runReceiver implements the receiver state machine.
 func (s *Session) runReceiver(ctx context.Context) error {
 	state := srxInit
@@ -182,7 +190,7 @@ func (s *Session) runReceiver(ctx context.Context) error {
 			if err != nil {
 				consecutiveErr++
 				retries++
-				if retries > 25 { // higher limit for file transfer per Mystic
+				if retries > dataRetryBudget {
 					closeWriter(curWriter)
 					s.handler.FileCompleted(curInfo, bytesReceived, fmt.Errorf("max retries exceeded"))
 					return fmt.Errorf("zmodem: max retries exceeded during data transfer")
@@ -223,7 +231,7 @@ func (s *Session) runReceiver(ctx context.Context) error {
 					s.logger.Debug("data error, sending ZRPOS", "err", err, "offset", fileOffset)
 					s.tr.purge()
 					retries++
-					if retries > 25 {
+					if retries > dataRetryBudget {
 						closeWriter(curWriter)
 						s.handler.FileCompleted(curInfo, bytesReceived, fmt.Errorf("max retries exceeded"))
 						return fmt.Errorf("zmodem: max retries exceeded during data transfer")
