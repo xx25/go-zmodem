@@ -12,6 +12,7 @@ This is a library package — there is no CLI. Users import the `zmodem` package
 - Resume (crash recovery) via ZRPOS when the reader implements `io.ReadSeeker`
 - Adaptive block sizing (256 up to 8192 bytes)
 - XON/XOFF stripping, control character escaping
+- ZedZap (8K subpackets) and DirZap (minimal escaping) variants via `Config.EscapeMode` / `Config.MaxBlockSize`
 - Tested against lrzsz (`rz`/`sz`) for interoperability
 
 ## Install
@@ -213,17 +214,20 @@ func (r *receiver) AcceptFile(info zmodem.FileInfo) (io.WriteCloser, int64, erro
 
 `Config` controls session behavior:
 
-| Field              | Default | Description                                         |
-|--------------------|---------|-----------------------------------------------------|
-| `MaxBlockSize`     | 1024    | Data subpacket size (max 8192)                      |
-| `WindowSize`       | 0       | Streaming window size (0 = full streaming)          |
-| `EscapeMode`       | `EscapeStandard` | ZDLE escaping mode: `EscapeStandard`, `EscapeAll`, `EscapeMinimal` |
-| `Use32BitCRC`      | false   | Prefer CRC-32 when receiver supports it             |
-| `AttnSequence`     | nil     | Attention string for interrupting sender (max 32 B) |
-| `RecvTimeout`      | 10s     | Idle timeout for reads (0 = disabled)               |
-| `MaxFileSize`      | 0       | Max accepted file size (0 = unlimited)              |
-| `MaxRetries`       | 10      | Max retransmission attempts before abort            |
-| `GarbageThreshold` | 1200    | Max garbage bytes before aborting                   |
+| Field              | Default          | Description                                            |
+|--------------------|------------------|--------------------------------------------------------|
+| `MaxBlockSize`     | 1024             | Data subpacket size (max 8192; 8192 = ZedZap)          |
+| `WindowSize`       | 0                | Streaming window size (0 = full streaming)             |
+| `EscapeMode`       | `EscapeStandard` | ZDLE escaping: `EscapeStandard`, `EscapeAll`, `EscapeMinimal` (DirZap) |
+| `Use32BitCRC`      | false            | Prefer CRC-32 when receiver supports it                |
+| `AttnSequence`     | nil              | Attention string for interrupting sender (max 32 B)    |
+| `RecvTimeout`      | 10s              | Idle timeout for reads (0 = disabled)                  |
+| `Capabilities`     | 0                | Extra receiver capability flags to advertise           |
+| `MaxFileSize`      | 0                | Max accepted file size (0 = unlimited)                 |
+| `MaxRetries`       | 10               | Max retransmission attempts before abort               |
+| `GarbageThreshold` | 1200             | Max garbage bytes before aborting                      |
+| `Znulls`           | 0                | Null bytes sent before ZDATA headers                   |
+| `Logger`           | `slog.Default()` | Optional structured logger for frame traces            |
 
 Pass `nil` for `Config` to use defaults (10s recv timeout, CRC-16, 1024-byte blocks).
 
