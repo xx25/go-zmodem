@@ -126,6 +126,15 @@ const (
 	XOFF = 0x13
 )
 
+// EscapeMode controls which bytes are ZDLE-escaped on the wire.
+type EscapeMode int
+
+const (
+	EscapeStandard EscapeMode = iota // Standard ZMODEM/ZedZap (default)
+	EscapeAll                        // Escape all control chars (hostile transports)
+	EscapeMinimal                    // DirZap: escape only ZDLE (0x18)
+)
+
 // CAN is the cancel character; 5 consecutive CANs abort a session.
 const CAN = 0x18
 

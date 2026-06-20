@@ -221,7 +221,7 @@ func TestLrzszA1_SendSmallCRC16(t *testing.T) {
 	})
 
 	session := NewSession(conn, handler, &Config{
-		Use32BitCRC: false,
+		Use32BitCRC:  false,
 		MaxBlockSize: 1024,
 	})
 
@@ -258,7 +258,7 @@ func TestLrzszA2_SendCRC32(t *testing.T) {
 	})
 
 	session := NewSession(conn, handler, &Config{
-		Use32BitCRC: true,
+		Use32BitCRC:  true,
 		MaxBlockSize: 1024,
 	})
 
@@ -450,7 +450,7 @@ func TestLrzszA7_SendEscapeAll(t *testing.T) {
 	})
 
 	session := NewSession(conn, handler, &Config{
-		EscapeAll:    true,
+		EscapeMode:   EscapeAll,
 		MaxBlockSize: 1024,
 	})
 
@@ -509,7 +509,7 @@ func TestLrzszB2_RecvCRC32(t *testing.T) {
 
 	handler := newLrzszRecvHandler(recvDir)
 	session := NewSession(conn, handler, &Config{
-		Use32BitCRC: true,
+		Use32BitCRC:  true,
 		MaxBlockSize: 1024,
 	})
 
@@ -642,7 +642,7 @@ func TestLrzszB6_RecvEscapeAll(t *testing.T) {
 
 	handler := newLrzszRecvHandler(recvDir)
 	session := NewSession(conn, handler, &Config{
-		EscapeAll:    true,
+		EscapeMode:   EscapeAll,
 		MaxBlockSize: 1024,
 	})
 

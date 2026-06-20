@@ -51,7 +51,7 @@ func TestScanForPadResetsGarbagePerScan(t *testing.T) {
 	buf.WriteByte(ZDLE)
 	buf.WriteByte(ZHEX)
 
-	tr := newTransportReader(&buf, threshold, 0, slog.Default())
+	tr := newTransportReader(&buf, threshold, 0, true, slog.Default())
 
 	// ceil(n/threshold)+1 is the upper bound on scans the fixed code needs:
 	// each scan drains up to `threshold` bytes, plus one tail scan to land on

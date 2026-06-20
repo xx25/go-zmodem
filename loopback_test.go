@@ -539,9 +539,9 @@ func TestLoopbackCRC32(t *testing.T) {
 // ZCRCG subpacket (identified by the ZDLE+ZCRCG byte pair in the stream).
 type corruptingWriter struct {
 	w            io.Writer
-	targetCount  int     // which subpacket to corrupt (1-based)
-	currentCount int32   // atomic counter for ZCRCG sequences seen
-	prev         byte    // previous byte for ZDLE detection
+	targetCount  int   // which subpacket to corrupt (1-based)
+	currentCount int32 // atomic counter for ZCRCG sequences seen
+	prev         byte  // previous byte for ZDLE detection
 	corrupted    atomic.Bool
 }
 
@@ -1095,4 +1095,3 @@ func (sw *snoopingWriter) Write(p []byte) (int, error) {
 	}
 	return sw.w.Write(p)
 }
-

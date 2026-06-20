@@ -21,7 +21,7 @@ type deadlineSetter interface {
 }
 
 // transportReader wraps an io.Reader with buffering, ZDLE decoding,
-// XON/XOFF stripping, and garbage counting.
+// optional XON/XOFF stripping, and garbage counting.
 type transportReader struct {
 	r            *bufio.Reader
 	ds           deadlineSetter // nil if transport lacks deadline support
@@ -29,15 +29,17 @@ type transportReader struct {
 	garbageCount int
 	garbageMax   int
 	canCount     int // consecutive CAN characters seen
+	stripXonXoff bool
 	logger       *slog.Logger
 }
 
-func newTransportReader(r io.Reader, garbageMax int, timeout time.Duration, logger *slog.Logger) *transportReader {
+func newTransportReader(r io.Reader, garbageMax int, timeout time.Duration, stripXonXoff bool, logger *slog.Logger) *transportReader {
 	tr := &transportReader{
-		r:          bufio.NewReaderSize(r, 4096),
-		timeout:    timeout,
-		garbageMax: garbageMax,
-		logger:     logger,
+		r:            bufio.NewReaderSize(r, 4096),
+		timeout:      timeout,
+		garbageMax:   garbageMax,
+		stripXonXoff: stripXonXoff,
+		logger:       logger,
 	}
 	if ds, ok := r.(deadlineSetter); ok {
 		tr.ds = ds
@@ -55,17 +57,19 @@ func (tr *transportReader) readByte() (byte, error) {
 	return tr.r.ReadByte()
 }
 
-// readByteStrip reads one byte, stripping XON/XOFF.
+// readByteStrip reads one byte, optionally stripping XON/XOFF.
 func (tr *transportReader) readByteStrip() (byte, error) {
 	for {
 		b, err := tr.readByte()
 		if err != nil {
 			return 0, err
 		}
-		// Strip XON/XOFF and their parity variants
-		switch b & 0x7f {
-		case XON, XOFF:
-			continue
+		if tr.stripXonXoff {
+			// Strip XON/XOFF and their parity variants
+			switch b & 0x7f {
+			case XON, XOFF:
+				continue
+			}
 		}
 		return b, nil
 	}

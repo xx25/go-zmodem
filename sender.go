@@ -89,7 +89,7 @@ func (s *Session) runSender(ctx context.Context) error {
 		case stxSInit:
 			// Send ZSINIT with attention sequence
 			hdr := makeHeader(ZSINIT)
-			if s.cfg.EscapeAll {
+			if s.cfg.EscapeMode == EscapeAll {
 				hdr.SetZF0(TESCCTL)
 			}
 
@@ -99,18 +99,18 @@ func (s *Session) runSender(ctx context.Context) error {
 			}
 
 			// ZSINIT data must escape control chars even if not globally set
-			oldEsc := s.tw.escapeAll
-			s.tw.setEscapeAll(true)
+			oldMode := s.tw.escapeMode
+			s.tw.setEscapeMode(EscapeAll)
 			attn := s.cfg.AttnSequence
 			if len(attn) > 32 {
 				attn = attn[:32]
 			}
 			attn = append(attn, 0) // null-terminate
 			if err := s.sendSubpacket(attn, ZCRCW); err != nil {
-				s.tw.setEscapeAll(oldEsc)
+				s.tw.setEscapeMode(oldMode)
 				return err
 			}
-			s.tw.setEscapeAll(oldEsc)
+			s.tw.setEscapeMode(oldMode)
 
 			// Wait for ZACK
 			rxHdr, err := s.recvHeaderRetry(ctx, &retries)
@@ -598,7 +598,7 @@ func (s *Session) processZRINIT(hdr Header) {
 	// Escape negotiation
 	if (s.remoteFlags & ESCCTL) != 0 {
 		s.remoteEscAll = true
-		s.tw.setEscapeAll(true)
+		s.tw.setEscapeMode(EscapeAll)
 	}
 }
 
