@@ -23,6 +23,11 @@ const (
 	stxDone                           // Session complete
 )
 
+// maxSkipFin bounds how many spurious turnaround ZFIN headers the sender
+// tolerates while waiting for the peer's ZRINIT before giving up. Mirrors
+// bforce's ZRXSKIPFIN ("Don't believe first ZFIN on outgoing calls").
+const maxSkipFin = 2
+
 // runSender implements the sender state machine.
 func (s *Session) runSender(ctx context.Context) error {
 	state := stxInit
@@ -40,6 +45,8 @@ func (s *Session) runSender(ctx context.Context) error {
 		zcrcwRetries int
 		filesLeft    int
 		bytesLeft    int64
+		autoDLSent   bool // AutoDownloadString (rz\r) emitted once, not per ZRQINIT
+		skipFin      int  // tolerated turnaround ZFINs (see maxSkipFin)
 	)
 
 	blockSize = 256
@@ -52,9 +59,14 @@ func (s *Session) runSender(ctx context.Context) error {
 
 		switch state {
 		case stxInit:
-			// Send auto-download trigger + ZRQINIT
-			if err := s.tw.writeRaw(AutoDownloadString); err != nil {
-				return err
+			// Send the auto-download trigger (rz\r) exactly once. Re-entering
+			// stxInit to tolerate a turnaround ZFIN (see the ZFIN arm below)
+			// must re-send only the ZRQINIT header, not the rz\r preamble.
+			if !autoDLSent {
+				if err := s.tw.writeRaw(AutoDownloadString); err != nil {
+					return err
+				}
+				autoDLSent = true
 			}
 			hdr := makeHeader(ZRQINIT)
 			if err := s.sendHexHeader(hdr); err != nil {
@@ -82,6 +94,26 @@ func (s *Session) runSender(ctx context.Context) error {
 					return err
 				}
 				// Stay in stxInit to wait for ZRINIT
+			case ZFIN:
+				// Tolerate a spurious turnaround ZFIN. In a WaZOO session
+				// turnaround the answerer runs a complete receive batch and
+				// then a complete send batch (two ZMODEM sessions); some peers
+				// (e.g. T-Mail) emit a stray ZFIN at the start of the reverse
+				// batch — the tail of their batch-1 teardown, a retransmitted
+				// ZFIN, or an OO race — before turning around to accept ours.
+				// Aborting on the first ZFIN strands our outbound batch; the
+				// reference mailer bforce instead ignores a bounded number of
+				// ZFINs here ("Don't believe first ZFIN on outgoing calls",
+				// ZRXSKIPFIN=2). Resend ZRQINIT and stay in stxInit. The
+				// skipFin counter is deliberately separate from the retries
+				// read budget: a received ZFIN is a successful read, so it must
+				// not be charged against retries, and a genuinely hung peer is
+				// still bounded by maxSkipFin.
+				skipFin++
+				if skipFin > maxSkipFin {
+					return fmt.Errorf("zmodem: sender got %d turnaround ZFINs waiting for ZRINIT", skipFin)
+				}
+				// Loop back into stxInit: ZRQINIT is re-sent, rz\r is not.
 			default:
 				return fmt.Errorf("zmodem: sender expected ZRINIT, got %s", frameTypeName(rxHdr.Type))
 			}

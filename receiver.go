@@ -35,6 +35,7 @@ func (s *Session) runReceiver(ctx context.Context) error {
 		curInfo        FileInfo
 		curWriter      io.WriteCloser
 		fileOffset     int64
+		incomingPos    int64 // position of the incoming byte stream (see srxData)
 		bytesReceived  int64
 		retries        int
 		consecutiveErr int // errors outside ZDATA
@@ -65,8 +66,21 @@ func (s *Session) runReceiver(ctx context.Context) error {
 				if retries >= s.cfg.MaxRetries {
 					return fmt.Errorf("zmodem: max retries exceeded waiting for ZFILE")
 				}
-				// Send ZNAK
-				if err := s.sendHexHeader(makeHeader(ZNAK)); err != nil {
+				// Re-prompt the sender with ZRINIT, not ZNAK. While waiting
+				// for the first ZFILE we hold no accepted file, so the
+				// keep-waiting / timeout response must be "I am ready to
+				// receive, send it again" — which is exactly ZRINIT. The
+				// historical WaZOO mailers (bforce, BinkleyTerm XE,
+				// xenia-mailer) all resend their receive-init header here and
+				// never use ZNAK as the wait response; some peers mirror an
+				// inbound ZNAK rather than advancing, which deadlocks the
+				// handshake. This covers every recvHeader failure in this arm
+				// (read timeout, garbage overflow, and hex/binary header CRC
+				// errors alike): with no file yet to negotiate against, a
+				// single uniform ZRINIT re-prompt is the safe answer. The
+				// MaxRetries bound and the consecutiveErr "peer likely not
+				// ZMODEM" guard above still terminate a truly dead peer.
+				if err := s.sendZRINIT(); err != nil {
 					return err
 				}
 				continue
@@ -211,18 +225,43 @@ func (s *Session) runReceiver(ctx context.Context) error {
 					s.useCRC32 = true
 				}
 				dataPos := hdr.Position()
-				if dataPos != fileOffset {
-					s.logger.Warn("ZDATA position mismatch", "expected", fileOffset, "got", dataPos)
-					// Send ZRPOS to correct
+				switch {
+				case dataPos > fileOffset:
+					// The peer resumed AHEAD of the bytes we have written.
+					// Our receive writer is append-only (AcceptFile hands back
+					// a plain io.WriteCloser with no seek/truncate contract),
+					// so we cannot leave a hole and fill it later. Re-ask the
+					// peer to resume exactly at our write position.
+					s.logger.Warn("ZDATA position ahead of write offset, re-requesting",
+						"expected", fileOffset, "got", dataPos)
 					s.tr.purge()
 					if err := s.sendHexHeader(makePosHeader(ZRPOS, fileOffset)); err != nil {
 						return err
 					}
 					continue
+				case dataPos < fileOffset:
+					// The peer resumed BEHIND our write offset (it honoured an
+					// earlier/lower ZRPOS, or retransmits a frame whose start is
+					// below where we already are). Re-sending ZRPOS here is what
+					// deadlocks the resume at large offsets: the peer keeps
+					// answering from its frame boundary and we keep rejecting it.
+					// Instead, accept the frame and discard the overlapping
+					// [dataPos, fileOffset) bytes as receiveDataSubpackets
+					// consumes them, writing only the tail once the incoming
+					// stream catches up to fileOffset. The written fileOffset
+					// stays monotonic — the overlap is dropped, never rewritten —
+					// so this is safe against the append-only writer. incomingPos
+					// is the separate cursor that tracks the incoming stream so
+					// we know how much of each subpacket is duplicate.
+					s.logger.Debug("ZDATA position behind write offset, discarding overlap",
+						"writeOffset", fileOffset, "got", dataPos)
+					incomingPos = dataPos
+				default:
+					incomingPos = fileOffset
 				}
 
 				// Receive data subpackets
-				if err := s.receiveDataSubpackets(ctx, curWriter, &curInfo, &fileOffset, &bytesReceived, &retries); err != nil {
+				if err := s.receiveDataSubpackets(ctx, curWriter, &curInfo, &fileOffset, &incomingPos, &bytesReceived, &retries); err != nil {
 					if err == errEOFReceived {
 						state = srxEOF
 						continue
@@ -318,8 +357,16 @@ func (s *Session) runReceiver(ctx context.Context) error {
 var errEOFReceived = fmt.Errorf("EOF received")
 
 // receiveDataSubpackets reads data subpackets until ZCRCE or error.
+//
+// offset is the append-only write position (advances only by bytes actually
+// written). incomingPos is the position of the incoming byte stream and is
+// always <= offset; it advances by the full length of every consumed subpacket,
+// including bytes that fall inside an already-written overlap and are discarded.
+// When the peer resumed below the write offset, the leading [incomingPos,
+// offset) bytes of the stream are duplicates the append-only writer cannot
+// rewrite, so they are dropped and only the tail beyond offset is written.
 func (s *Session) receiveDataSubpackets(ctx context.Context, w io.Writer, info *FileInfo,
-	offset *int64, received *int64, retries *int) error {
+	offset *int64, incomingPos *int64, received *int64, retries *int) error {
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -331,19 +378,46 @@ func (s *Session) receiveDataSubpackets(ctx context.Context, w io.Writer, info *
 			return err
 		}
 
-		// Write data
-		if len(data) > 0 {
-			if _, err := w.Write(data); err != nil {
+		// A valid subpacket (good CRC) is real progress toward the resume
+		// point even when every byte falls inside the discarded overlap and
+		// nothing is written. Reset the retry budget on the valid subpacket
+		// itself, NOT gated on bytes written: when the peer resumed well below
+		// our write offset the recovery streams many good-CRC-but-fully-
+		// duplicate subpackets, and a write-gated reset would let the data
+		// retry budget drain to exhaustion during the very catch-up it is
+		// meant to enable.
+		*retries = 0
+
+		// Split the subpacket into the duplicate overlap (already written,
+		// discard) and the new tail (write). incomingPos drives the discard,
+		// not offset: offset does not move during a wholly-overlapping run, and
+		// dataPos is only the frame's start.
+		writeData := data
+		if *incomingPos < *offset {
+			overlap := *offset - *incomingPos
+			if overlap >= int64(len(data)) {
+				writeData = nil // wholly inside the overlap — drop it all
+			} else {
+				writeData = data[overlap:]
+			}
+		}
+		*incomingPos += int64(len(data))
+
+		// Write the new tail (if any)
+		if len(writeData) > 0 {
+			if _, err := w.Write(writeData); err != nil {
 				return fmt.Errorf("zmodem: file write error: %w", err)
 			}
-			*offset += int64(len(data))
+			*offset += int64(len(writeData))
 			*received = *offset
-			*retries = 0 // successful data resets retry count
 
 			// Progress callback
 			s.handler.FileProgress(*info, *received)
 		}
 
+		// ZACK reports the incoming-stream position (= what the peer has sent),
+		// which equals offset in the normal no-overlap case and trails it to
+		// the peer's true position while catching up over an overlap.
 		switch endType {
 		case ZCRCG:
 			// Continue — no response needed
@@ -351,14 +425,14 @@ func (s *Session) receiveDataSubpackets(ctx context.Context, w io.Writer, info *
 
 		case ZCRCQ:
 			// Send ZACK with current position
-			if err := s.sendHexHeader(makePosHeader(ZACK, *offset)); err != nil {
+			if err := s.sendHexHeader(makePosHeader(ZACK, *incomingPos)); err != nil {
 				return err
 			}
 			continue
 
 		case ZCRCW:
 			// Send ZACK, then wait for next frame
-			if err := s.sendHexHeader(makePosHeader(ZACK, *offset)); err != nil {
+			if err := s.sendHexHeader(makePosHeader(ZACK, *incomingPos)); err != nil {
 				return err
 			}
 			return nil // return to outer loop to read next header

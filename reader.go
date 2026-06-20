@@ -291,12 +291,16 @@ func (tr *transportReader) clearDeadline() {
 	}
 }
 
-// purge reads and discards data for a short duration to clear stale transport data.
-// Used before sending ZRPOS in error recovery.
+// purge discards the bytes currently sitting in the bufio buffer to clear stale
+// transport data before sending ZRPOS in error recovery. It only drops what is
+// already buffered (it does not, and cannot non-blockingly, drain the OS/modem
+// serial buffer), and it logs the discarded byte count so a frame trace can show
+// whether a recovery cycle dropped a fresh inbound header or left stale in-flight
+// bytes behind — the otherwise-invisible signal needed to diagnose a resync loop.
 func (tr *transportReader) purge() {
-	// Discard whatever is buffered
 	n := tr.r.Buffered()
 	if n > 0 {
 		tr.r.Discard(n)
 	}
+	tr.logger.Debug("purge: discarded buffered bytes", "count", n)
 }
