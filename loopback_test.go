@@ -222,6 +222,87 @@ func TestLoopbackSingleFile(t *testing.T) {
 	}
 }
 
+// TestLoopbackDirZap exercises DirZap mode: 8192-byte subpackets with minimal
+// ZDLE escaping (only 0x18 escaped) and no XON/XOFF stripping on receive. The
+// payload deliberately contains XON (0x11), XOFF (0x13), and ZDLE (0x18) bytes
+// in bulk — in DirZap these are data, not flow control, so they must survive a
+// round trip untouched. If stripXonXoff were left enabled, the 0x11/0x13 bytes
+// would be silently dropped and the content check below would fail.
+func TestLoopbackDirZap(t *testing.T) {
+	senderTransport, receiverTransport, senderClose, receiverClose := newTestTransports()
+
+	// Multi-block payload (>8192) covering every byte value, plus dense runs of
+	// the flow-control and escape bytes DirZap must pass through verbatim.
+	var testContent []byte
+	for i := 0; i < 96; i++ {
+		for b := 0; b < 256; b++ {
+			testContent = append(testContent, byte(b))
+		}
+	}
+	testContent = append(testContent, bytes.Repeat([]byte{XON, XOFF, ZDLE, 0x91, 0x93, 0x98}, 128)...)
+
+	senderHandler := newTestHandler()
+	senderHandler.filesToSend = []*FileOffer{
+		{
+			Name:    "dirzap.bin",
+			Size:    int64(len(testContent)),
+			ModTime: time.Now(),
+			Mode:    0644,
+			Reader:  bytes.NewReader(testContent),
+		},
+	}
+
+	receiverHandler := newTestHandler()
+
+	// Both sides agree on DirZap: 8K blocks + minimal escaping.
+	cfg := &Config{MaxBlockSize: 8192, EscapeMode: EscapeMinimal}
+	sender := NewSession(senderTransport, senderHandler, cfg)
+	receiver := NewSession(receiverTransport, receiverHandler, cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var sendErr, recvErr error
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer senderClose()
+		sendErr = sender.Send(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		defer receiverClose()
+		recvErr = receiver.Receive(ctx)
+	}()
+
+	wg.Wait()
+
+	if sendErr != nil {
+		t.Fatalf("sender error: %v", sendErr)
+	}
+	if recvErr != nil {
+		t.Fatalf("receiver error: %v", recvErr)
+	}
+
+	receiverHandler.mu.Lock()
+	defer receiverHandler.mu.Unlock()
+
+	received, ok := receiverHandler.receivedFiles["dirzap.bin"]
+	if !ok {
+		t.Fatal("file 'dirzap.bin' not received")
+	}
+	if !bytes.Equal(received.Bytes(), testContent) {
+		t.Errorf("DirZap content mismatch: got %d bytes, want %d bytes", received.Len(), len(testContent))
+	}
+	if err, ok := receiverHandler.completedFiles["dirzap.bin"]; !ok {
+		t.Error("file not marked as completed")
+	} else if err != nil {
+		t.Errorf("file completed with error: %v", err)
+	}
+}
+
 func TestLoopbackBatchFiles(t *testing.T) {
 	senderTransport, receiverTransport, senderClose, receiverClose := newTestTransports()
 
