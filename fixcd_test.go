@@ -2,9 +2,17 @@ package zmodem
 
 import (
 	"bytes"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 )
+
+// discardLogger returns a logger that drops all output, for tests that exercise
+// debug-logging code paths without polluting test output.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 // --- Fix C: phase-aware (data-phase) read timeout ---------------------------
 

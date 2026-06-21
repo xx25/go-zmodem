@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"time"
 )
 
@@ -14,13 +13,6 @@ var (
 	errGarbageOverflow = errors.New("zmodem: garbage count exceeded threshold")
 	errAbortReceived   = errors.New("zmodem: session aborted by remote (5x CAN)")
 	errUnsupportedEnc  = errors.New("zmodem: unsupported frame encoding")
-
-	// errDrainByteCap and errDrainWallCap end a quiesce-drain that never reached
-	// silence because the sender kept streaming. They are the bounded, clean
-	// failure the data-phase recovery returns instead of discarding forever when
-	// a peer ignores the reverse-channel ZRPOS and streams continuously to EOF.
-	errDrainByteCap = errors.New("zmodem: data-recovery drain exceeded byte cap (sender streaming without re-framing)")
-	errDrainWallCap = errors.New("zmodem: data-recovery drain exceeded time cap (sender streaming without re-framing)")
 )
 
 // deadlineSetter is implemented by transports that support read deadlines (e.g. net.Conn).
@@ -41,7 +33,7 @@ type transportReader struct {
 	canCount     int // consecutive CAN characters seen
 	stripXonXoff bool
 	logger       *slog.Logger
-	now          func() time.Time // wall clock; overridable in tests for deterministic drain caps
+	now          func() time.Time // wall clock; overridable in tests for the deterministic progress-stall timer
 }
 
 func newTransportReader(r io.Reader, garbageMax int, timeout time.Duration, stripXonXoff bool, logger *slog.Logger) *transportReader {
@@ -317,13 +309,6 @@ func (tr *transportReader) clearDeadline() {
 	}
 }
 
-// deadlineCapable reports whether the transport supports read deadlines and a
-// positive idle timeout is configured for some phase — the precondition for the
-// quiesce-drain recovery to sense a stream going quiet.
-func (tr *transportReader) deadlineCapable() bool {
-	return tr.ds != nil && (tr.timeout > 0 || tr.dataTimeout > 0)
-}
-
 // purge discards the bytes currently sitting in the bufio buffer to clear stale
 // transport data before sending ZRPOS in error recovery. It only drops what is
 // already buffered (it does not, and cannot non-blockingly, drain the OS/modem
@@ -336,64 +321,4 @@ func (tr *transportReader) purge() {
 		tr.r.Discard(n)
 	}
 	tr.logger.Debug("purge: discarded buffered bytes", "count", n)
-}
-
-// drainToQuiet reads and discards bytes until the incoming stream goes quiet,
-// then returns the number of bytes discarded with a nil error. "Quiet" means a
-// read blocked for the whole quietGap without a byte arriving: that gap is the
-// signal a streaming sender has finished its in-flight window and the line is
-// now silent enough for a single reverse-channel ZRPOS to be noticed, instead of
-// being lost in a continuous ZCRCG backlog.
-//
-// Every blocking read is fenced by a fresh quietGap read deadline, so the drain
-// can never park indefinitely on a single read. Two absolute caps bound a sender
-// that never goes quiet — one streaming continuously (or trickling below the gap)
-// to EOF: once maxBytes have been discarded or maxWall has elapsed the drain
-// stops and returns errDrainByteCap / errDrainWallCap, so the caller aborts the
-// transfer cleanly and bounded rather than discarding forever. Any non-timeout
-// transport error (carrier loss, closed port, EOF) is returned immediately so
-// the caller aborts on it.
-//
-// Only meaningful on a deadline-capable transport; callers must check tr.ds != nil
-// && tr.timeout > 0 before relying on the quiescence signal.
-func (tr *transportReader) drainToQuiet(quietGap time.Duration, maxBytes int64, maxWall time.Duration) (int64, error) {
-	var discarded int64
-
-	// The bytes already sitting in the bufio buffer are part of the in-flight
-	// backlog; drop them first and count them against the byte cap.
-	if n := tr.r.Buffered(); n > 0 {
-		_, _ = tr.r.Discard(n)
-		discarded += int64(n)
-	}
-
-	start := tr.now()
-	buf := make([]byte, 2048)
-	for {
-		if discarded >= maxBytes {
-			tr.logger.Debug("drain: byte cap reached", "discarded", discarded, "cap", maxBytes)
-			return discarded, errDrainByteCap
-		}
-		if tr.now().Sub(start) >= maxWall {
-			tr.logger.Debug("drain: wall-clock cap reached", "discarded", discarded, "cap", maxWall)
-			return discarded, errDrainWallCap
-		}
-
-		if tr.ds != nil {
-			_ = tr.ds.SetReadDeadline(tr.now().Add(quietGap))
-		}
-		n, err := tr.r.Read(buf)
-		if n > 0 {
-			discarded += int64(n)
-		}
-		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				// The read gap elapsed with no byte: the stream is quiescent.
-				tr.logger.Debug("drain: stream quiesced", "discarded", discarded)
-				return discarded, nil
-			}
-			// Carrier loss / closed transport / EOF: not a recoverable gap.
-			return discarded, err
-		}
-	}
 }

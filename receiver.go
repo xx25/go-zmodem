@@ -21,27 +21,15 @@ const (
 	srxDone                            // Session complete
 )
 
-// dataRetryBudget is the maximum number of failed recvHeader attempts the
-// data phase (srxData) tolerates before aborting "max retries exceeded during
-// data transfer". Higher than the file-wait MaxRetries per Mystic, because a
-// single mid-stream data error must be recoverable: each retry purges and
-// re-sends ZRPOS, and the in-flight backlog the receiver drains while hunting
-// for the peer's resync frame can span several of these attempts.
-//
-// This budget governs the legacy recovery path (purge + immediate ZRPOS) used on
-// transports without read-deadline support. Deadline-capable transports use the
-// quiesce-drain recovery instead, bounded by dataRecoveryBudget.
+// dataRetryBudget is the maximum number of consecutive data-phase recovery
+// cycles (each a purge + single ZRPOS) tolerated before aborting "max retries
+// exceeded during data transfer". It is the abort criterion ONLY when
+// Config.DataStallTimeout == 0 (the legacy count-based mode). Higher than the
+// file-wait MaxRetries because a single mid-stream data error must be
+// recoverable: a valid subpacket resets the counter, so this only trips on a run
+// of consecutive errors with no good data in between. When DataStallTimeout > 0
+// the progress-aware abort supersedes this count (see recoverData).
 const dataRetryBudget = 25
-
-// dataRecoveryBudget is the maximum number of quiesce-drain recovery cycles the
-// data phase tolerates before aborting. Each cycle drains the backlog to silence
-// then sends one ZRPOS and waits a full RecvTimeout for the peer's fresh ZDATA,
-// so a cycle is far more expensive (and far more meaningful) than a legacy
-// per-scan retry — a small budget keeps total recovery time bounded. A sender
-// that re-frames on ZRPOS recovers in one cycle; the budget only accrues across
-// consecutive recoveries that re-frame and then immediately error again before
-// any data is written (a valid subpacket resets the counter).
-const dataRecoveryBudget = 4
 
 // runReceiver implements the receiver state machine.
 func (s *Session) runReceiver(ctx context.Context) error {
@@ -210,6 +198,9 @@ func (s *Session) runReceiver(ctx context.Context) error {
 			fileOffset = offset
 			bytesReceived = offset
 			retries = 0
+			// Start the progress-stall clock at data-phase entry so the first
+			// stall window (Config.DataStallTimeout) is measured from here.
+			s.lastProgressAt = s.tr.now()
 
 			// Send ZRPOS (always hex for lrzsz compat)
 			if err := s.sendHexHeader(makePosHeader(ZRPOS, fileOffset)); err != nil {
@@ -367,48 +358,40 @@ func (s *Session) runReceiver(ctx context.Context) error {
 // continue (a fresh ZRPOS was issued; the next recvHeader should pick up the
 // peer's resync at fileOffset) or a non-nil error to abort the transfer.
 //
-// On a deadline-capable transport it implements the quiesce-drain strategy: the
-// failing peer (notably a continuous-streaming ZAP sender that does not honour a
-// reverse-channel ZRPOS while mid-window) is given silence to re-frame. The
-// receiver drains the in-flight backlog until the line goes quiet, then sends
-// exactly one ZRPOS — counting one retry per quiesce+ZRPOS cycle, not per scan,
-// so the wasted re-request spam of the old purge+ZRPOS-every-0.4s loop is gone.
-// If the sender never goes quiet (streams to EOF ignoring ZRPOS), the drain's
-// absolute byte/wall caps fire and the transfer aborts cleanly and bounded
-// rather than discarding forever; a carrier-loss or closed-transport error from
-// the drain propagates straight out so a dropped call aborts fast.
+// The strategy is the conformant one used by the reference ZMODEM mailers
+// (lrzsz, qico, FTNd): purge the stale in-flight bytes and send ONE ZRPOS at the
+// write offset immediately, then let the outer loop read the sender's re-framed
+// ZDATA under the data-phase read timeout. A conformant sender samples the
+// reverse channel after every subpacket, so the leading ZPAD of our ZRPOS
+// interrupts its stream and it re-seeks — no need to wait for the line to go
+// quiet first (a continuously-streaming sender never does, which would only
+// stall recovery).
 //
-// On a transport without read-deadline support (e.g. in-memory loopback pipes)
-// quiescence cannot be sensed, so the historical purge + immediate ZRPOS path is
-// retained, bounded by dataRetryBudget.
+// Abort criterion:
+//   - DataStallTimeout > 0 (progress-aware): abort only when the transfer has
+//     made no progress (no valid data subpacket) for the whole window. A
+//     noisy-but-advancing link keeps going indefinitely because each good
+//     subpacket refreshes lastProgressAt; a genuinely stuck transfer aborts.
+//   - DataStallTimeout == 0 (legacy): abort after dataRetryBudget consecutive
+//     recovery cycles (a valid subpacket resets the counter).
+//
+// The maxConsecutiveErr guard in runReceiver is the pure-garbage backstop in
+// both modes (a peer that never emits a valid subpacket never refreshes either).
 func (s *Session) recoverData(fileOffset int64, retries *int) error {
 	*retries++
 
-	if s.tr.deadlineCapable() {
-		if *retries > dataRecoveryBudget {
-			return fmt.Errorf("zmodem: max recovery cycles (%d) exceeded during data transfer", dataRecoveryBudget)
+	if s.cfg.DataStallTimeout > 0 {
+		if s.tr.now().Sub(s.lastProgressAt) >= s.cfg.DataStallTimeout {
+			return fmt.Errorf("zmodem: data transfer stalled: no progress for %s", s.cfg.DataStallTimeout)
 		}
-		discarded, err := s.tr.drainToQuiet(
-			s.cfg.DataRecoveryQuietGap, s.cfg.DataRecoveryMaxBytes, s.cfg.DataRecoveryMaxWall)
-		if err != nil {
-			// Drain cap hit (sender streaming without re-framing) or a transport
-			// fault (carrier loss / closed port): abort, bounded and clean.
-			return fmt.Errorf("zmodem: data transfer recovery failed after draining %d bytes: %w", discarded, err)
-		}
-		// Interrupt the sender with the attention sequence (if one is set) before
-		// re-requesting position, the spec-designed way to break a streamer.
-		if err := s.sendAttn(); err != nil {
-			return err
-		}
-		s.logger.Debug("data recovery: stream quiesced, sending single ZRPOS",
-			"discarded", discarded, "offset", fileOffset, "cycle", *retries)
-		return s.sendHexHeader(makePosHeader(ZRPOS, fileOffset))
-	}
-
-	if *retries > dataRetryBudget {
+	} else if *retries > dataRetryBudget {
 		return fmt.Errorf("zmodem: max retries exceeded during data transfer")
 	}
+
 	s.tr.purge()
+	// Interrupt a streaming sender with the attention sequence if one is set
+	// (no-op by default); the ZPAD-prefixed ZRPOS below is itself the interrupt a
+	// conformant sender catches.
 	if err := s.sendAttn(); err != nil {
 		return err
 	}
@@ -487,13 +470,14 @@ func (s *Session) receiveDataSubpackets(ctx context.Context, w io.Writer, info *
 
 		// A valid subpacket (good CRC) is real progress toward the resume
 		// point even when every byte falls inside the discarded overlap and
-		// nothing is written. Reset the retry budget on the valid subpacket
-		// itself, NOT gated on bytes written: when the peer resumed well below
-		// our write offset the recovery streams many good-CRC-but-fully-
-		// duplicate subpackets, and a write-gated reset would let the data
-		// retry budget drain to exhaustion during the very catch-up it is
-		// meant to enable.
+		// nothing is written. Reset the retry budget AND the progress-stall
+		// clock on the valid subpacket itself, NOT gated on bytes written: when
+		// the peer resumed well below our write offset the recovery streams many
+		// good-CRC-but-fully-duplicate subpackets, and a write-gated reset would
+		// let the budget drain (or the stall timer fire) during the very catch-up
+		// it is meant to enable.
 		*retries = 0
+		s.lastProgressAt = s.tr.now()
 
 		// Split the subpacket into the duplicate overlap (already written,
 		// discard) and the new tail (write). incomingPos drives the discard,

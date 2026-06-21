@@ -20,28 +20,6 @@ var ErrSkip = errors.New("skip file")
 // silently lose the read timeout.
 const DefaultRecvTimeout = 10 * time.Second
 
-// Data-phase recovery (quiesce-drain) defaults. When a mid-stream data error
-// hits and the transport supports read deadlines, the receiver drains the
-// in-flight backlog until the sender pauses, then sends exactly one ZRPOS into
-// the silence (see runReceiver). These bound that drain so a sender that never
-// goes quiet — one streaming continuously to EOF while ignoring the
-// reverse-channel ZRPOS — fails cleanly and bounded instead of forever.
-const (
-	// DefaultDataRecoveryQuietGap is the read-gap that signals the sender has
-	// paused (finished its in-flight window). It must be longer than the normal
-	// inter-burst gap of a streaming sender so steady streaming is not mistaken
-	// for quiescence, yet far shorter than RecvTimeout so a real pause is caught
-	// promptly.
-	DefaultDataRecoveryQuietGap = 1500 * time.Millisecond
-	// DefaultDataRecoveryMaxBytes caps the bytes discarded per recovery before
-	// the drain gives up on a never-quiet sender. Generous enough to absorb a
-	// large in-flight window at low baud, bounded enough to fail in seconds.
-	DefaultDataRecoveryMaxBytes = 512 * 1024
-	// DefaultDataRecoveryMaxWall caps the wall-clock spent draining per recovery,
-	// catching a sub-gap trickle that would never trip the byte cap quickly.
-	DefaultDataRecoveryMaxWall = 30 * time.Second
-)
-
 // FileHandler is the application callback interface for file operations.
 type FileHandler interface {
 	// NextFile returns the next file to send, or nil if no more files.
@@ -128,16 +106,16 @@ type Config struct {
 	MaxRetries int
 	// GarbageThreshold: max garbage bytes before aborting (default 1200)
 	GarbageThreshold int
-	// DataRecoveryQuietGap: read-gap that signals the sender has paused, used by
-	// the data-phase quiesce-drain recovery. 0 → DefaultDataRecoveryQuietGap.
-	// Effective only on a deadline-capable transport (e.g. net.Conn / modem).
-	DataRecoveryQuietGap time.Duration
-	// DataRecoveryMaxBytes: absolute cap on bytes discarded per recovery drain
-	// before aborting a never-quiet sender. 0 → DefaultDataRecoveryMaxBytes.
-	DataRecoveryMaxBytes int64
-	// DataRecoveryMaxWall: absolute cap on wall-clock per recovery drain before
-	// aborting a never-quiet sender. 0 → DefaultDataRecoveryMaxWall.
-	DataRecoveryMaxWall time.Duration
+	// DataStallTimeout: progress-aware data-phase abort window. When > 0, a
+	// mid-stream transfer is aborted only if it makes NO progress (no valid data
+	// subpacket received) for this long — instead of after a fixed count of
+	// consecutive errors. A noisy-but-advancing link (frequent CRC errors with
+	// good subpackets in between, each of which resets the timer) therefore keeps
+	// going as long as it advances, while a genuinely dead transfer still aborts.
+	// 0 ⇒ the legacy count-based budget (dataRetryBudget) applies, unchanged. The
+	// maxConsecutiveErr "peer not ZMODEM" guard is the pure-garbage backstop in
+	// both modes.
+	DataStallTimeout time.Duration
 	// Znulls: number of null bytes before ZDATA headers (default 0)
 	Znulls int
 	// Logger: optional structured logger for frame traces (recv/send headers,
@@ -163,15 +141,8 @@ func (c *Config) defaults() {
 	if c.GarbageThreshold <= 0 {
 		c.GarbageThreshold = 1200
 	}
-	if c.DataRecoveryQuietGap <= 0 {
-		c.DataRecoveryQuietGap = DefaultDataRecoveryQuietGap
-	}
-	if c.DataRecoveryMaxBytes <= 0 {
-		c.DataRecoveryMaxBytes = DefaultDataRecoveryMaxBytes
-	}
-	if c.DataRecoveryMaxWall <= 0 {
-		c.DataRecoveryMaxWall = DefaultDataRecoveryMaxWall
-	}
+	// DataStallTimeout is left as supplied: 0 means "use the legacy count-based
+	// budget", a deliberate opt-in for the progress-aware abort.
 }
 
 // Session represents a ZMODEM transfer session over a transport.
@@ -190,6 +161,12 @@ type Session struct {
 	remoteEscAll     bool   // remote wants all control chars escaped
 	attnSeq          []byte // negotiated attention sequence
 	remoteWindowSize int    // receiver buffer size from ZRINIT (ZP0+ZP1)
+
+	// lastProgressAt is the clock time of the most recent valid data subpacket,
+	// used by the progress-aware data-phase abort (Config.DataStallTimeout). It is
+	// (re)set on entry to the data phase and on every good-CRC subpacket, so the
+	// stall window measures "time since the transfer last made progress".
+	lastProgressAt time.Time
 
 	mu     sync.Mutex
 	active bool // prevents concurrent Send/Receive
