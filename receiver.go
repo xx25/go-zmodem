@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 )
 
 type receiverState int
@@ -26,7 +27,21 @@ const (
 // single mid-stream data error must be recoverable: each retry purges and
 // re-sends ZRPOS, and the in-flight backlog the receiver drains while hunting
 // for the peer's resync frame can span several of these attempts.
+//
+// This budget governs the legacy recovery path (purge + immediate ZRPOS) used on
+// transports without read-deadline support. Deadline-capable transports use the
+// quiesce-drain recovery instead, bounded by dataRecoveryBudget.
 const dataRetryBudget = 25
+
+// dataRecoveryBudget is the maximum number of quiesce-drain recovery cycles the
+// data phase tolerates before aborting. Each cycle drains the backlog to silence
+// then sends one ZRPOS and waits a full RecvTimeout for the peer's fresh ZDATA,
+// so a cycle is far more expensive (and far more meaningful) than a legacy
+// per-scan retry — a small budget keeps total recovery time bounded. A sender
+// that re-frames on ZRPOS recovers in one cycle; the budget only accrues across
+// consecutive recoveries that re-frame and then immediately error again before
+// any data is written (a valid subpacket resets the counter).
+const dataRecoveryBudget = 4
 
 // runReceiver implements the receiver state machine.
 func (s *Session) runReceiver(ctx context.Context) error {
@@ -56,6 +71,9 @@ func (s *Session) runReceiver(ctx context.Context) error {
 			state = srxFileWait
 
 		case srxFileWait:
+			// Control phase: revert to the (shorter) control-phase read timeout
+			// after any preceding data phase.
+			s.tr.setDataPhase(false)
 			hdr, err := s.recvHeader()
 			if err != nil {
 				consecutiveErr++
@@ -197,22 +215,19 @@ func (s *Session) runReceiver(ctx context.Context) error {
 			if err := s.sendHexHeader(makePosHeader(ZRPOS, fileOffset)); err != nil {
 				return err
 			}
+			// Entering the data phase: subsequent blocking reads use the
+			// (possibly longer) data-phase read timeout.
+			s.tr.setDataPhase(true)
 			state = srxData
 
 		case srxData:
 			hdr, err := s.recvHeader()
 			if err != nil {
 				consecutiveErr++
-				retries++
-				if retries > dataRetryBudget {
+				if rerr := s.recoverData(fileOffset, &retries); rerr != nil {
 					closeWriter(curWriter)
-					s.handler.FileCompleted(curInfo, bytesReceived, fmt.Errorf("max retries exceeded"))
-					return fmt.Errorf("zmodem: max retries exceeded during data transfer")
-				}
-				// Purge and send ZRPOS
-				s.tr.purge()
-				if err := s.sendHexHeader(makePosHeader(ZRPOS, fileOffset)); err != nil {
-					return err
+					s.handler.FileCompleted(curInfo, bytesReceived, rerr)
+					return rerr
 				}
 				continue
 			}
@@ -266,17 +281,12 @@ func (s *Session) runReceiver(ctx context.Context) error {
 						state = srxEOF
 						continue
 					}
-					// CRC error or other: purge and ZRPOS
+					// CRC error / read timeout / other mid-stream fault: recover.
 					s.logger.Debug("data error, sending ZRPOS", "err", err, "offset", fileOffset)
-					s.tr.purge()
-					retries++
-					if retries > dataRetryBudget {
+					if rerr := s.recoverData(fileOffset, &retries); rerr != nil {
 						closeWriter(curWriter)
-						s.handler.FileCompleted(curInfo, bytesReceived, fmt.Errorf("max retries exceeded"))
-						return fmt.Errorf("zmodem: max retries exceeded during data transfer")
-					}
-					if err := s.sendHexHeader(makePosHeader(ZRPOS, fileOffset)); err != nil {
-						return err
+						s.handler.FileCompleted(curInfo, bytesReceived, rerr)
+						return rerr
 					}
 				}
 
@@ -351,6 +361,103 @@ func (s *Session) runReceiver(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// recoverData runs one data-phase error-recovery cycle and returns nil to
+// continue (a fresh ZRPOS was issued; the next recvHeader should pick up the
+// peer's resync at fileOffset) or a non-nil error to abort the transfer.
+//
+// On a deadline-capable transport it implements the quiesce-drain strategy: the
+// failing peer (notably a continuous-streaming ZAP sender that does not honour a
+// reverse-channel ZRPOS while mid-window) is given silence to re-frame. The
+// receiver drains the in-flight backlog until the line goes quiet, then sends
+// exactly one ZRPOS — counting one retry per quiesce+ZRPOS cycle, not per scan,
+// so the wasted re-request spam of the old purge+ZRPOS-every-0.4s loop is gone.
+// If the sender never goes quiet (streams to EOF ignoring ZRPOS), the drain's
+// absolute byte/wall caps fire and the transfer aborts cleanly and bounded
+// rather than discarding forever; a carrier-loss or closed-transport error from
+// the drain propagates straight out so a dropped call aborts fast.
+//
+// On a transport without read-deadline support (e.g. in-memory loopback pipes)
+// quiescence cannot be sensed, so the historical purge + immediate ZRPOS path is
+// retained, bounded by dataRetryBudget.
+func (s *Session) recoverData(fileOffset int64, retries *int) error {
+	*retries++
+
+	if s.tr.deadlineCapable() {
+		if *retries > dataRecoveryBudget {
+			return fmt.Errorf("zmodem: max recovery cycles (%d) exceeded during data transfer", dataRecoveryBudget)
+		}
+		discarded, err := s.tr.drainToQuiet(
+			s.cfg.DataRecoveryQuietGap, s.cfg.DataRecoveryMaxBytes, s.cfg.DataRecoveryMaxWall)
+		if err != nil {
+			// Drain cap hit (sender streaming without re-framing) or a transport
+			// fault (carrier loss / closed port): abort, bounded and clean.
+			return fmt.Errorf("zmodem: data transfer recovery failed after draining %d bytes: %w", discarded, err)
+		}
+		// Interrupt the sender with the attention sequence (if one is set) before
+		// re-requesting position, the spec-designed way to break a streamer.
+		if err := s.sendAttn(); err != nil {
+			return err
+		}
+		s.logger.Debug("data recovery: stream quiesced, sending single ZRPOS",
+			"discarded", discarded, "offset", fileOffset, "cycle", *retries)
+		return s.sendHexHeader(makePosHeader(ZRPOS, fileOffset))
+	}
+
+	if *retries > dataRetryBudget {
+		return fmt.Errorf("zmodem: max retries exceeded during data transfer")
+	}
+	s.tr.purge()
+	if err := s.sendAttn(); err != nil {
+		return err
+	}
+	return s.sendHexHeader(makePosHeader(ZRPOS, fileOffset))
+}
+
+// breakSender is an optional transport capability: a serial transport that can
+// assert a line BREAK. Used to honour an AttnBreak meta-byte in the attention
+// sequence; transports without it simply skip the break.
+type breakSender interface {
+	SendBreak() error
+}
+
+// sendAttn transmits the attention sequence to interrupt a streaming sender
+// before a data-phase ZRPOS. The sequence is raw (un-framed) bytes carrying two
+// meta-characters: AttnBreak asserts a line break if the transport supports it
+// (otherwise it is skipped), AttnPause pauses one second, and every other byte
+// is written literally. It is a no-op when no attention sequence has been set
+// (neither configured as a default nor negotiated via the peer's ZSINIT), so by
+// default nothing extra reaches the wire.
+func (s *Session) sendAttn() error {
+	if len(s.attnSeq) == 0 {
+		return nil
+	}
+	for _, b := range s.attnSeq {
+		switch b {
+		case AttnBreak:
+			if err := s.tw.Flush(); err != nil {
+				return err
+			}
+			if bs, ok := s.transport.(breakSender); ok {
+				if err := bs.SendBreak(); err != nil {
+					return err
+				}
+			} else {
+				s.logger.Debug("attn: transport cannot assert break, skipping AttnBreak")
+			}
+		case AttnPause:
+			if err := s.tw.Flush(); err != nil {
+				return err
+			}
+			time.Sleep(time.Second)
+		default:
+			if err := s.tw.writeRaw([]byte{b}); err != nil {
+				return err
+			}
+		}
+	}
+	return s.tw.Flush()
 }
 
 // errEOFReceived is a sentinel used internally to signal ZEOF during data reception.

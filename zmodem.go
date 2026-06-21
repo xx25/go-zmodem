@@ -20,6 +20,28 @@ var ErrSkip = errors.New("skip file")
 // silently lose the read timeout.
 const DefaultRecvTimeout = 10 * time.Second
 
+// Data-phase recovery (quiesce-drain) defaults. When a mid-stream data error
+// hits and the transport supports read deadlines, the receiver drains the
+// in-flight backlog until the sender pauses, then sends exactly one ZRPOS into
+// the silence (see runReceiver). These bound that drain so a sender that never
+// goes quiet — one streaming continuously to EOF while ignoring the
+// reverse-channel ZRPOS — fails cleanly and bounded instead of forever.
+const (
+	// DefaultDataRecoveryQuietGap is the read-gap that signals the sender has
+	// paused (finished its in-flight window). It must be longer than the normal
+	// inter-burst gap of a streaming sender so steady streaming is not mistaken
+	// for quiescence, yet far shorter than RecvTimeout so a real pause is caught
+	// promptly.
+	DefaultDataRecoveryQuietGap = 1500 * time.Millisecond
+	// DefaultDataRecoveryMaxBytes caps the bytes discarded per recovery before
+	// the drain gives up on a never-quiet sender. Generous enough to absorb a
+	// large in-flight window at low baud, bounded enough to fail in seconds.
+	DefaultDataRecoveryMaxBytes = 512 * 1024
+	// DefaultDataRecoveryMaxWall caps the wall-clock spent draining per recovery,
+	// catching a sub-gap trickle that would never trip the byte cap quickly.
+	DefaultDataRecoveryMaxWall = 30 * time.Second
+)
+
 // FileHandler is the application callback interface for file operations.
 type FileHandler interface {
 	// NextFile returns the next file to send, or nil if no more files.
@@ -88,6 +110,16 @@ type Config struct {
 	// For transports without deadline support, callers must handle cancellation
 	// externally (e.g. by closing the transport).
 	RecvTimeout time.Duration
+	// DataRecvTimeout: idle read timeout used DURING the data phase (while
+	// receiving ZDATA subpackets), in place of RecvTimeout. 0 means "use
+	// RecvTimeout". A value larger than RecvTimeout lets a brief mid-stream
+	// flow-control pause (a V.42bis/LAPM buffer stall, an XON/XOFF hold) ride out
+	// without tripping an error-recovery resync, while the shorter RecvTimeout
+	// still bounds the control phases (waiting for ZFILE, ZEOF, ZRINIT). Safe to
+	// lengthen even on a real modem: a dropped carrier is detected out-of-band
+	// (DCD poll) regardless of how long this timeout is, so a longer wait only
+	// delays recovery on a live-but-quiet line, never on a dead one.
+	DataRecvTimeout time.Duration
 	// Capabilities: receiver capability flags to advertise
 	Capabilities byte
 	// MaxFileSize: maximum accepted file size (0 = unlimited)
@@ -96,6 +128,16 @@ type Config struct {
 	MaxRetries int
 	// GarbageThreshold: max garbage bytes before aborting (default 1200)
 	GarbageThreshold int
+	// DataRecoveryQuietGap: read-gap that signals the sender has paused, used by
+	// the data-phase quiesce-drain recovery. 0 → DefaultDataRecoveryQuietGap.
+	// Effective only on a deadline-capable transport (e.g. net.Conn / modem).
+	DataRecoveryQuietGap time.Duration
+	// DataRecoveryMaxBytes: absolute cap on bytes discarded per recovery drain
+	// before aborting a never-quiet sender. 0 → DefaultDataRecoveryMaxBytes.
+	DataRecoveryMaxBytes int64
+	// DataRecoveryMaxWall: absolute cap on wall-clock per recovery drain before
+	// aborting a never-quiet sender. 0 → DefaultDataRecoveryMaxWall.
+	DataRecoveryMaxWall time.Duration
 	// Znulls: number of null bytes before ZDATA headers (default 0)
 	Znulls int
 	// Logger: optional structured logger for frame traces (recv/send headers,
@@ -120,6 +162,15 @@ func (c *Config) defaults() {
 	}
 	if c.GarbageThreshold <= 0 {
 		c.GarbageThreshold = 1200
+	}
+	if c.DataRecoveryQuietGap <= 0 {
+		c.DataRecoveryQuietGap = DefaultDataRecoveryQuietGap
+	}
+	if c.DataRecoveryMaxBytes <= 0 {
+		c.DataRecoveryMaxBytes = DefaultDataRecoveryMaxBytes
+	}
+	if c.DataRecoveryMaxWall <= 0 {
+		c.DataRecoveryMaxWall = DefaultDataRecoveryMaxWall
 	}
 }
 
@@ -170,6 +221,12 @@ func NewSession(transport io.ReadWriter, handler FileHandler, cfg *Config) *Sess
 		tw:        newTransportWriter(transport, c.EscapeMode),
 		tr:        newTransportReader(transport, c.GarbageThreshold, c.RecvTimeout, c.EscapeMode != EscapeMinimal, logger),
 	}
+	// Seed the attention sequence from config so a receiver has a default Attn to
+	// interrupt a streaming sender even when the peer sends no ZSINIT to negotiate
+	// one; a ZSINIT, if it arrives, overwrites this (see runReceiver).
+	s.attnSeq = c.AttnSequence
+	// The data phase may use a longer idle read timeout than the control phases.
+	s.tr.dataTimeout = c.DataRecvTimeout
 	return s
 }
 
