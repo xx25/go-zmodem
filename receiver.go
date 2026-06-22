@@ -446,6 +446,11 @@ func (s *Session) sendAttn() error {
 // errEOFReceived is a sentinel used internally to signal ZEOF during data reception.
 var errEOFReceived = fmt.Errorf("EOF received")
 
+// errMergeSuspected signals a suspected lost-ZDLE merged subpacket (CRC-16):
+// the outer loop recovers it like any data-phase fault (purge + ZRPOS at the
+// write offset), so the sender re-sends the boundary cleanly.
+var errMergeSuspected = fmt.Errorf("zmodem: suspected merged (lost-ZDLE) subpacket")
+
 // receiveDataSubpackets reads data subpackets until ZCRCE or error.
 //
 // offset is the append-only write position (advances only by bytes actually
@@ -478,6 +483,32 @@ func (s *Session) receiveDataSubpackets(ctx context.Context, w io.Writer, info *
 		// it is meant to enable.
 		*retries = 0
 		s.lastProgressAt = s.tr.now()
+
+		// Lost-ZDLE merge guard (CRC-16 only — CRC-32's frame residue differs,
+		// so a merge fails the outer CRC and never reaches here). A merged
+		// subpacket passes the CRC-16 check via the residue property but carries
+		// 3 stray bytes (a swallowed end-marker + its CRC) that would land at a
+		// valid offset as silent corruption. Detect the embedded frame and
+		// re-get from the write offset. A false positive (legit bytes that
+		// happen to look like an embedded frame) re-sends identical bytes and
+		// trips again at the same offset; accept it the second time so a rare
+		// coincidence costs one round-trip instead of stalling the transfer.
+		if s.cfg.DetectMergedSubpackets && !s.useCRC32 {
+			if sp := detectMergedSubpacketCRC16(data); sp >= 0 {
+				if s.mergeSuspectOffset != *offset {
+					s.logger.Debug("merged subpacket suspected, re-getting",
+						"offset", *offset, "len", len(data), "split", sp)
+					s.mergeSuspectOffset = *offset
+					return errMergeSuspected
+				}
+				// Second hit at the same write offset: the re-sent bytes are
+				// identical, so this is a false positive (a real merge re-sends
+				// the boundary cleanly), not a lost ZDLE. Accept it.
+				s.logger.Debug("merged subpacket re-confirmed at same offset, accepting as false positive",
+					"offset", *offset, "len", len(data), "split", sp)
+			}
+			s.mergeSuspectOffset = -1
+		}
 
 		// Split the subpacket into the duplicate overlap (already written,
 		// discard) and the new tail (write). incomingPos drives the discard,

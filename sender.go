@@ -7,6 +7,11 @@ import (
 	"io"
 )
 
+// testKittenStreamRecovery, when true, keeps the sender streaming after a ZRPOS
+// instead of going synchronous (ZCRCW) — models a continuously-streaming peer
+// (KittenMail) that leaves stale in-flight data after a resync. TEST-ONLY.
+var testKittenStreamRecovery bool
+
 type senderState int
 
 const (
@@ -290,7 +295,7 @@ func (s *Session) runSender(ctx context.Context) error {
 							blockSize = max(blockSize/4, 32)
 							goodBlocks = 0
 							unreliable = true
-							zcrcwNext = true
+							zcrcwNext = !testKittenStreamRecovery
 							zcrcwRetries = 0
 							state = stxData
 							sendLoop = true
@@ -348,7 +353,7 @@ func (s *Session) runSender(ctx context.Context) error {
 							blockSize = max(blockSize/4, 32)
 							goodBlocks = 0
 							unreliable = true
-							zcrcwNext = true
+							zcrcwNext = !testKittenStreamRecovery
 							zcrcwRetries = 0
 							state = stxData
 							sendLoop = true
@@ -438,7 +443,7 @@ func (s *Session) runSender(ctx context.Context) error {
 								blockSize = max(blockSize/4, 32)
 								goodBlocks = 0
 								unreliable = true
-								zcrcwNext = true
+								zcrcwNext = !testKittenStreamRecovery
 								zcrcwRetries = 0
 							default:
 								s.logger.Debug("unexpected ZCRCW response", "type", frameTypeName(rxHdr.Type))
@@ -485,7 +490,7 @@ func (s *Session) runSender(ctx context.Context) error {
 								blockSize = max(blockSize/4, 32)
 								goodBlocks = 0
 								unreliable = true
-								zcrcwNext = true
+								zcrcwNext = !testKittenStreamRecovery
 								zcrcwRetries = 0
 								state = stxData
 								sendLoop = true
@@ -564,7 +569,7 @@ func (s *Session) runSender(ctx context.Context) error {
 				blockSize = max(blockSize/4, 32)
 				goodBlocks = 0
 				unreliable = true
-				zcrcwNext = true
+				zcrcwNext = !testKittenStreamRecovery
 				zcrcwRetries = 0
 				state = stxData
 			case ZNAK:

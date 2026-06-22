@@ -85,6 +85,44 @@ func (s *Session) recvSubpacket(maxLen int) ([]byte, byte, error) {
 	return s.recvSubpacketCRC16(data, maxLen)
 }
 
+// detectMergedSubpacketCRC16 scans an already-CRC-valid subpacket for an
+// EMBEDDED complete subpacket frame — the fingerprint of a lost ZDLE that
+// silently merged two subpackets.
+//
+// When the wire drops the ZDLE that introduces a subpacket end-marker
+// (ZDLE ZCRCx), the receiver does not see the boundary: it swallows the
+// orphaned end-char + that subpacket's own 2 CRC bytes + the next subpacket's
+// data as one oversized subpacket. Because a CRC-16 message followed by its own
+// CRC has residue 0 (CRC-16/CCITT, init 0), the merged subpacket's CRC equals
+// the SECOND subpacket's transmitted CRC, so the corrupt frame passes the outer
+// CRC check and writes 3 stray bytes (end-char + CRC) at a valid offset.
+//
+// The tell is structural: at the swallowed boundary i, data[i] is a ZCRC
+// end-char and CRC16(data[:i] + data[i]) matches the two bytes after it — i.e.
+// data[:i] is itself a complete valid subpacket. A legitimate subpacket
+// essentially never contains such an internal frame (~1/65536 per ZCRC-valued
+// byte); a merge always does. Returns the split length (len of the embedded
+// first subpacket) or -1.
+func detectMergedSubpacketCRC16(data []byte) int {
+	if len(data) < 4 {
+		return -1
+	}
+	running := uint16(0) // crc16 of data[:i]
+	for i := 1; i <= len(data)-3; i++ {
+		running = crc16Update(running, data[i-1:i])
+		c := data[i]
+		if c < ZCRCE || c > ZCRCW {
+			continue
+		}
+		want := crc16Finalize(crc16Update(running, data[i:i+1]))
+		got := uint16(data[i+1])<<8 | uint16(data[i+2])
+		if want == got {
+			return i
+		}
+	}
+	return -1
+}
+
 func (s *Session) recvSubpacketCRC16(data []byte, maxLen int) ([]byte, byte, error) {
 	for {
 		b, frameEnd, err := s.tr.zdlRead()

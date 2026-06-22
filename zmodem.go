@@ -72,6 +72,17 @@ type Config struct {
 	EscapeMode EscapeMode
 	// Use32BitCRC: prefer CRC-32 when receiver supports it
 	Use32BitCRC bool
+	// DetectMergedSubpackets guards the CRC-16 lost-ZDLE merge detector
+	// (detectMergedSubpacketCRC16). When a peer that cannot do CRC-32 transfers
+	// over a link that drops bytes locally (e.g. a flaky RS232/USB serial path),
+	// a lost ZDLE merges two subpackets and the CRC-16 residue property lets the
+	// corrupt frame pass — silent corruption. With this set the receiver detects
+	// the embedded frame and re-gets it. Default off: the recovery re-gets a
+	// good-CRC subpacket mid-stream (a ZRPOS resync), which can briefly storm on
+	// stale in-flight data, so it MUST be paired with a progress-aware
+	// DataStallTimeout (>0) — never the legacy count budget — or a rare false
+	// positive could exhaust it. Only meaningful for CRC-16 sessions.
+	DetectMergedSubpackets bool
 	// AttnSequence: attention string for interrupting sender (max 32 bytes)
 	AttnSequence []byte
 	// RecvTimeout: idle timeout for reads from the remote.
@@ -168,6 +179,13 @@ type Session struct {
 	// stall window measures "time since the transfer last made progress".
 	lastProgressAt time.Time
 
+	// mergeSuspectOffset is the write offset at which a suspected lost-ZDLE
+	// merged subpacket (CRC-16) was last rejected. If the re-sent subpacket at
+	// the same offset trips the detector again it is the SAME legit bytes (a
+	// false positive, not a real merge), so it is accepted to avoid a stall
+	// loop. -1 = none outstanding. See detectMergedSubpacketCRC16.
+	mergeSuspectOffset int64
+
 	mu     sync.Mutex
 	active bool // prevents concurrent Send/Receive
 }
@@ -191,12 +209,13 @@ func NewSession(transport io.ReadWriter, handler FileHandler, cfg *Config) *Sess
 	}
 
 	s := &Session{
-		transport: transport,
-		handler:   handler,
-		cfg:       c,
-		logger:    logger,
-		tw:        newTransportWriter(transport, c.EscapeMode),
-		tr:        newTransportReader(transport, c.GarbageThreshold, c.RecvTimeout, c.EscapeMode != EscapeMinimal, logger),
+		transport:          transport,
+		handler:            handler,
+		cfg:                c,
+		logger:             logger,
+		tw:                 newTransportWriter(transport, c.EscapeMode),
+		tr:                 newTransportReader(transport, c.GarbageThreshold, c.RecvTimeout, c.EscapeMode != EscapeMinimal, logger),
+		mergeSuspectOffset: -1,
 	}
 	// Seed the attention sequence from config so a receiver has a default Attn to
 	// interrupt a streaming sender even when the peer sends no ZSINIT to negotiate
