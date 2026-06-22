@@ -285,7 +285,26 @@ func (s *Session) runReceiver(ctx context.Context) error {
 				// Validate offset
 				eofPos := hdr.Position()
 				if eofPos != fileOffset {
-					// IGNORE mismatched ZEOF (spec revision 07-31-1987)
+					if eofPos < fileOffset {
+						// The sender declares EOF BELOW our write offset: we have
+						// written past the real end of file. With a known size the
+						// in-loop clamp prevents this, so reaching here means the
+						// size was unknown and a CRC-16 false-accept over-advanced
+						// us. The append-only writer cannot rewind, and the usual
+						// mismatch response (re-send ZRPOS at fileOffset) asks for
+						// bytes past the sender's EOF that it can never supply —
+						// which dead-locks the transfer until carrier drops (~60s),
+						// then forces a truncate-to-zero re-fetch anyway. Fail the
+						// file fast instead: the partial is retained and the next
+						// call resumes (or cleanly restarts) without the stall.
+						closeWriter(curWriter)
+						curWriter = nil
+						s.handler.FileCompleted(curInfo, bytesReceived, errOverwritePastEOF)
+						return errOverwritePastEOF
+					}
+					// eofPos > fileOffset: a premature/stale ZEOF ahead of our
+					// data. IGNORE it (spec revision 07-31-1987) and keep
+					// receiving; the real ZEOF at our offset will follow.
 					s.logger.Warn("ZEOF offset mismatch, ignoring",
 						"expected", fileOffset, "got", eofPos)
 					continue
@@ -451,6 +470,13 @@ var errEOFReceived = fmt.Errorf("EOF received")
 // write offset), so the sender re-sends the boundary cleanly.
 var errMergeSuspected = fmt.Errorf("zmodem: suspected merged (lost-ZDLE) subpacket")
 
+// errOverwritePastEOF aborts a file whose sender declared EOF below our
+// (append-only) write offset — we received more bytes than the file holds, so
+// the partial is unrecoverable in place. Failing fast with this avoids the
+// ZRPOS-vs-ZEOF dead-lock that otherwise spins until carrier loss. The handler
+// retains the partial; the next call resumes or cleanly restarts.
+var errOverwritePastEOF = fmt.Errorf("zmodem: received past declared end of file")
+
 // receiveDataSubpackets reads data subpackets until ZCRCE or error.
 //
 // offset is the append-only write position (advances only by bytes actually
@@ -524,6 +550,34 @@ func (s *Session) receiveDataSubpackets(ctx context.Context, w io.Writer, info *
 			}
 		}
 		*incomingPos += int64(len(data))
+
+		// Clamp the append-only write at the announced file size. The file
+		// cannot be larger than the size the sender declared in ZFILE, so any
+		// bytes that would push the write offset past info.Size are not real
+		// file content — they are a corrupt subpacket that slipped through the
+		// CRC-16 check (the 16-bit residue property lets a damaged subpacket
+		// pass ~1 in 65536), or a duplicate the overlap split did not catch.
+		// Dropping the excess keeps the write offset bounded by the true EOF.
+		// That bound is load-bearing: without it a single false-accept near EOF
+		// pushes the offset PAST the eventual ZEOF, after which the receiver
+		// keeps rejecting the legitimate ZEOF as an offset mismatch and spins
+		// ZRPOS for bytes the sender does not have — dead-locking the transfer
+		// until the modem drops carrier (~60s wasted), then forcing a full
+		// truncate-to-zero re-fetch on the next call. With the clamp the offset
+		// lands exactly on info.Size, the ZEOF matches, and the file completes
+		// (a corrupt body is then caught downstream by the TIC CRC-32 and
+		// re-requested — never silently delivered). Only applied when the size
+		// is known (>0); a sender that omits it keeps the unclamped behaviour.
+		if info.Size > 0 && len(writeData) > 0 {
+			if room := info.Size - *offset; room < int64(len(writeData)) {
+				if room < 0 {
+					room = 0
+				}
+				s.logger.Warn("subpacket overruns announced file size, clamping",
+					"offset", *offset, "size", info.Size, "subpacketTail", len(writeData), "kept", room)
+				writeData = writeData[:room]
+			}
+		}
 
 		// Write the new tail (if any)
 		if len(writeData) > 0 {
