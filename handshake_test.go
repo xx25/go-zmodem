@@ -364,3 +364,76 @@ func TestSenderTurnaroundZFINBounded(t *testing.T) {
 		t.Fatal("sender accepted unbounded turnaround ZFINs; want a clean error after maxSkipFin")
 	}
 }
+
+// TestSenderWaitsForZFINAfterStrayZRINIT pins the behaviour an empty batch
+// depends on when the peer's negotiation loop writes before it reads.
+//
+// MBSE's mbcico receives like this (zmrecv.c tryz()): send ZRINIT at the top of
+// every pass, then read one header. So the ZRINIT for pass N+1 goes out while
+// our ZFIN from pass N is still in flight, and our ZFIN is answered only after
+// it. The sender must keep reading until the ZFIN it is owed arrives.
+//
+// Neither shortcut works. Treating the stray ZRINIT as end-of-session leaves
+// mbcico's receive incomplete, so it turns around to send and finds the link
+// gone ("Zmodem: Unable to initiate send"). Re-sending ZFIN is worse: the peer
+// answers a ZFIN with ackbibi(), which sends ZFIN and then reads our "OO", and
+// a second ZFIN lands in that read as a bare ZPAD ("ackbibi got '*'").
+func TestSenderWaitsForZFINAfterStrayZRINIT(t *testing.T) {
+	r1, rawW1 := bufferedPipe(256) // sender -> peer
+	r2, w2 := bufferedPipe(256)    // peer -> sender
+
+	rec := &recordWriter{w: rawW1}
+	senderT := &pipeReadWriter{Reader: r2, Writer: rec}
+	peerT := &pipeReadWriter{Reader: r1, Writer: w2}
+
+	// Nothing to send: this is the empty batch a mailer runs when it has no
+	// mail for the peer but must still complete the transfer phase.
+	sender := NewSession(senderT, newTestHandler(), &Config{MaxBlockSize: 1024})
+	peer := NewSession(peerT, newTestHandler(), &Config{MaxBlockSize: 1024})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var sendErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer rawW1.Close()
+		sendErr = sender.Send(ctx)
+	}()
+
+	mustRecvType(t, peer, ZRQINIT, "first ZRQINIT")
+	if err := peer.sendZRINIT(); err != nil {
+		t.Fatalf("send ZRINIT: %v", err)
+	}
+
+	// The sender has nothing to offer, so it closes the batch.
+	mustRecvType(t, peer, ZFIN, "sender ZFIN")
+
+	// The stray ZRINIT: already in flight when that ZFIN was written.
+	if err := peer.sendZRINIT(); err != nil {
+		t.Fatalf("send stray ZRINIT: %v", err)
+	}
+	// Only now does the peer answer the ZFIN it read.
+	if err := peer.sendHexHeader(makeHeader(ZFIN)); err != nil {
+		t.Fatalf("send teardown ZFIN: %v", err)
+	}
+
+	<-done
+	w2.Close()
+
+	if sendErr != nil {
+		t.Fatalf("sender returned error: %v", sendErr)
+	}
+
+	// Exactly one ZFIN: a second one corrupts the peer's "OO" read.
+	out := rec.snapshot()
+	zfin := []byte{ZPAD, ZPAD, ZDLE, ZHEX, '0', '8'} // hex ZFIN (type 0x08)
+	if n := bytes.Count(out, zfin); n != 1 {
+		t.Fatalf("sender sent %d ZFINs, want exactly 1", n)
+	}
+	// And it finished the handshake rather than walking away from it.
+	if n := bytes.Count(out, []byte("OO")); n != 1 {
+		t.Fatalf("sender sent %d OO trailers, want exactly 1", n)
+	}
+}

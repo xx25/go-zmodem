@@ -611,7 +611,22 @@ func (s *Session) runSender(ctx context.Context) error {
 				retries++
 				state = stxFin
 			default:
-				state = stxDone
+				// The receiver has not answered our ZFIN yet, and this header
+				// was already in flight when we sent it. A ZRINIT is the
+				// ordinary case: a receiver whose negotiation loop writes
+				// ZRINIT at the top of every pass emits one just before it
+				// reads the ZFIN we already sent. MBSE's mbcico is written
+				// that way (zmrecv.c tryz(): send tryzhdrtype, then read).
+				//
+				// Keep reading rather than re-sending. Its answer to a ZFIN is
+				// ackbibi(), which sends ZFIN and then reads our "OO" -- a
+				// second ZFIN from us lands in that read as a bare ZPAD and
+				// makes it retry, so re-sending is what turns a slow answer
+				// into a broken one. Treating it as "done" is worse still: the
+				// peer finishes its receive, turns around to send, and finds
+				// the link gone.
+				retries++
+				state = stxFinAck
 			}
 		}
 
