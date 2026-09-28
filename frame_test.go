@@ -190,3 +190,25 @@ func TestHexHeaderLowercaseDigits(t *testing.T) {
 		}
 	}
 }
+
+// Portal of Power 0.63 ends every hex header with XON CR LF instead of
+// CR LF XON (captured in the test zone). lrzsz accepts any terminator
+// once the CRC checks, and so do we; two headers back to back must both
+// parse, the second after the first's odd terminator.
+func TestHexHeaderPortalXONBeforeCRLF(t *testing.T) {
+	zrinit := "**\x18B0100000023be50\x11\r\n"
+	buf := bytes.NewBufferString(zrinit + zrinit)
+	s := &Session{
+		tr:     newTransportReader(buf, 1200, 0, true, slog.Default()),
+		logger: slog.Default(),
+	}
+	for i := 0; i < 2; i++ {
+		hdr, err := s.recvHeader()
+		if err != nil {
+			t.Fatalf("header %d: %v", i+1, err)
+		}
+		if hdr.Type != ZRINIT || hdr.ZF0() != 0x23 {
+			t.Fatalf("header %d = %s ZF0=%#x, want ZRINIT 0x23", i+1, frameTypeName(hdr.Type), hdr.ZF0())
+		}
+	}
+}

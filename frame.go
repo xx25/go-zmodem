@@ -235,25 +235,36 @@ func (s *Session) recvHexHeader() (Header, error) {
 		return Header{}, fmt.Errorf("zmodem: hex header CRC error for %s", frameTypeName(hdr.Type))
 	}
 
-	// Read CR LF terminator (strip parity bits)
+	// Read the CR LF terminator (strip parity bits). The CRC has already
+	// vouched for the header, so the terminator is not held against it,
+	// as in lrzsz's zgethhdr (read one byte, and one more if it was CR).
+	// Portal of Power 0.63 puts its XON BEFORE the CR LF ("…be50 11 0d 0a")
+	// on every ZRINIT; rejecting that left it re-sending ZRINIT to a sender
+	// that never heard one.
 	cr, err := s.tr.readByte()
 	if err != nil {
 		return Header{}, err
 	}
-	if cr&0x7f != 0x0d {
-		// Some implementations may send LF only
-		if cr&0x7f == 0x0a {
+	if cr&0x7f == XON {
+		if cr, err = s.tr.readByte(); err != nil {
+			return Header{}, err
+		}
+	}
+	switch cr & 0x7f {
+	case 0x0a: // LF only
+		return hdr, nil
+	case 0x0d:
+		lf, err := s.tr.readByte()
+		if err != nil {
+			return Header{}, err
+		}
+		if lf&0x7f != 0x0a {
+			s.logger.Debug("zmodem: no LF after hex header CR", "type", frameTypeName(hdr.Type), "got", lf)
 			return hdr, nil
 		}
-		return Header{}, fmt.Errorf("zmodem: expected CR after hex header, got 0x%02x", cr)
-	}
-
-	lf, err := s.tr.readByte()
-	if err != nil {
-		return Header{}, err
-	}
-	if lf&0x7f != 0x0a {
-		return Header{}, fmt.Errorf("zmodem: expected LF after hex header CR, got 0x%02x", lf)
+	default:
+		s.logger.Debug("zmodem: no CR LF after hex header", "type", frameTypeName(hdr.Type), "got", cr)
+		return hdr, nil
 	}
 
 	// XON may follow (except for ZACK/ZFIN) — consume if present.

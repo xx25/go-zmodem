@@ -231,6 +231,14 @@ func (s *Session) runSender(ctx context.Context) error {
 				s.handler.FileCompleted(curInfo, 0, ErrSkip)
 				state = stxNextFile
 
+			case ZFERR:
+				// The receiver cannot create this file (FrontDoor on a name
+				// DOS cannot store). No data has gone yet, so it is a refusal
+				// of this one file, not of the batch: report it as a skip and
+				// offer the next one.
+				s.handler.FileCompleted(curInfo, 0, fmt.Errorf("%w: receiver could not create the file (ZFERR)", ErrSkip))
+				state = stxNextFile
+
 			case ZCRC:
 				crcVal, err := s.computeFileCRC(curOffer, rxHdr.Position())
 				if err != nil {
@@ -578,6 +586,11 @@ func (s *Session) runSender(ctx context.Context) error {
 			case ZSKIP:
 				s.handler.FileCompleted(curInfo, bytesSent, ErrSkip)
 				state = stxNextFile
+			case ZACK:
+				// A late acknowledgement of an earlier ZCRCQ/ZCRCW frame,
+				// delivered after our ZEOF by a line that buffers ahead of
+				// the receiver (a soft modem in front of a slow UART). It
+				// says nothing about the ZEOF; keep waiting for ZRINIT.
 			default:
 				return fmt.Errorf("zmodem: sender expected ZRINIT after ZEOF, got %s", frameTypeName(rxHdr.Type))
 			}
@@ -590,10 +603,22 @@ func (s *Session) runSender(ctx context.Context) error {
 			state = stxFinAck
 
 		case stxFinAck:
-			rxHdr, err := s.recvHeaderRetry(ctx, &retries)
-			if err != nil {
-				// Timeout at ZFIN is acceptable — session is done
+			if retries >= s.cfg.MaxRetries {
+				// No answer to any ZFIN: accept the session as done.
 				state = stxDone
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			rxHdr, err := s.recvHeader()
+			if err != nil {
+				// Silence, not a stray header: re-send ZFIN, as sz does.
+				// D'Bridge ignores the first ZFIN of an empty batch and
+				// answers only a repeat. (A header that crossed our ZFIN is
+				// handled below by reading on, never by re-sending.)
+				retries++
+				state = stxFin
 				continue
 			}
 
