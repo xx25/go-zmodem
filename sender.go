@@ -52,6 +52,7 @@ func (s *Session) runSender(ctx context.Context) error {
 		bytesLeft    int64
 		autoDLSent   bool // AutoDownloadString (rz\r) emitted once, not per ZRQINIT
 		skipFin      int  // tolerated turnaround ZFINs (see maxSkipFin)
+		lateZACKs    int  // ZACKs read after this file's ZEOF (see stxEOFAck)
 	)
 
 	blockSize = 256
@@ -179,6 +180,7 @@ func (s *Session) runSender(ctx context.Context) error {
 			fileOffset = 0
 			bytesSent = 0
 			retries = 0
+			lateZACKs = 0
 			goodBlocks = 0
 			zcrcwNext = false
 			zcrcwRetries = 0
@@ -591,6 +593,15 @@ func (s *Session) runSender(ctx context.Context) error {
 				// delivered after our ZEOF by a line that buffers ahead of
 				// the receiver (a soft modem in front of a slow UART). It
 				// says nothing about the ZEOF; keep waiting for ZRINIT.
+				// Bounded apart from the read retries, which a header that
+				// parses never spends: each ZCRCQ waits for its own ACK, so
+				// only a re-solicited one leaves a straggler (Brake!: at
+				// most one per file), and a peer answering ZEOF with ZACK
+				// forever must not hold the session.
+				lateZACKs++
+				if lateZACKs > s.cfg.MaxRetries {
+					return fmt.Errorf("zmodem: %d ZACKs after ZEOF and no ZRINIT", lateZACKs)
+				}
 			default:
 				return fmt.Errorf("zmodem: sender expected ZRINIT after ZEOF, got %s", frameTypeName(rxHdr.Type))
 			}

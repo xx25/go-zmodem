@@ -200,3 +200,71 @@ func TestSenderResendsZFINOnSilence(t *testing.T) {
 		t.Fatalf("no OO after the answered ZFIN; trailing bytes %q", rest)
 	}
 }
+
+// A peer that answers our ZEOF with ZACK forever must not hold the
+// session: late ZACKs are tolerated (Brake!: at most one per file), but
+// only MaxRetries of them.
+func TestSenderBoundsZACKsAfterZEOF(t *testing.T) {
+	r1, w1 := bufferedPipe(256)
+	r2, w2 := bufferedPipe(256)
+	senderT := &pipeReadWriter{Reader: r2, Writer: w1}
+	peerT := &pipeReadWriter{Reader: r1, Writer: w2}
+
+	content := []byte("acknowledged forever")
+	h := newTestHandler()
+	h.filesToSend = []*FileOffer{{Name: "flood.bin", Size: int64(len(content)), Reader: bytes.NewReader(content)}}
+	sender := NewSession(senderT, h, &Config{MaxBlockSize: 1024, MaxRetries: 5})
+	peer := NewSession(peerT, newTestHandler(), &Config{MaxBlockSize: 1024})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var sendErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer w1.Close()
+		sendErr = sender.Send(ctx)
+	}()
+
+	mustRecvType(t, peer, ZRQINIT, "ZRQINIT")
+	if err := peer.sendZRINIT(); err != nil {
+		t.Fatal(err)
+	}
+	mustRecvType(t, peer, ZFILE, "ZFILE")
+	if _, _, err := peer.recvSubpacket(2048); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.sendHexHeader(makePosHeader(ZRPOS, 0)); err != nil {
+		t.Fatal(err)
+	}
+	mustRecvType(t, peer, ZDATA, "ZDATA")
+	for {
+		_, end, err := peer.recvSubpacket(2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if end == ZCRCE {
+			break
+		}
+	}
+	mustRecvType(t, peer, ZEOF, "ZEOF")
+	for i := 0; i < 50; i++ {
+		if err := peer.sendHexHeader(makePosHeader(ZACK, 0)); err != nil {
+			break
+		}
+		select {
+		case <-done:
+			i = 50
+		default:
+		}
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("sender still waiting after a ZACK flood")
+	}
+	w2.Close()
+	if sendErr == nil {
+		t.Fatal("sender accepted endless ZACKs after ZEOF; want an error")
+	}
+}
